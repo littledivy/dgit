@@ -1,0 +1,25 @@
+{
+  // celld deployment config (local/self-hosted). Identical to wrangler.jsonc
+  // except GIT_TOKEN rides as a var: celld has string vars, not secrets.
+  // For a real fleet, change the token before deploying.
+  // NOTE: the script name stays "git-cells" — Durable Object data is bound
+  // to it, and renaming would orphan every hosted repository.
+  "name": "git-cells",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "REPO", "class_name": "RepoCell" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RepoCell", "Registry"] }
+  ],
+  "vars": {
+    "SITE_NAME": "dgit",
+    "SITE_DESC": "a fast webinterface for the git dscm, on celld",
+    "SITE_OWNER": "",
+    "GIT_TOKEN": "devtoken"
+  }
+}

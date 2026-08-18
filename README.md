@@ -1,0 +1,98 @@
+# dgit
+
+Durable **git**.
+
+dgit is a git server for Cloudflare Workers and for your own machines
+with [celld](https://celld.dev). Each repository is a Durable Object: a
+small server with a name and a private SQLite database that holds the
+repository's objects and refs, speaks the git smart HTTP protocol to a
+stock git client, and renders a cgit-style web interface. There is no
+origin server, no filesystem, and no GitHub in the critical path. A
+repository nobody touches costs almost nothing, and applications shard
+by construction: one hot repository cannot slow another. Reads are
+public; pushes authenticate; pushing to a name that does not exist
+creates the repository.
+
+## How it works
+
+dgit implements git in TypeScript: pkt-line framing, packfile parsing
+with ofs- and ref-delta resolution, pack generation over a streaming
+SHA-1, commit/tree/tag codecs, and a Myers diff. The one dependency is
+pako, for zlib.
+
+A push streams into the repository's cell and is stored as the packfile
+the client sent; an index maps each object id to its pack, offset, and
+delta base, so the client's compression is preserved rather than
+re-derived. A clone walks the closure of the requested refs and copies
+the stored compressed bytes verbatim into the outgoing pack. Fetch
+negotiation excludes the closure of the client's haves, cut correctly
+at shallow boundaries, so an incremental fetch downloads only what is
+missing. Shallow clones (`--depth`, deepening, `--unshallow`), thin
+packs, side-band progress, forced updates, and ref deletion behave as
+they do against any git server.
+
+The web interface is the cgit surface: summary, refs, log with search
+and per-path history, tree, blob with syntax highlighting, blame,
+commit and arbitrary-range diffs, `format-patch` output that applies
+cleanly with `git am`, tar.gz and zip snapshots of any ref, about pages
+rendered from the README, atom feeds, and commit-activity statistics.
+Repositories carry a description, an owner, a section on the index
+page, and a private flag that hides them and gates every read behind
+the push token.
+
+## Deploy to Cloudflare
+
+```sh
+npm install
+npx wrangler deploy
+npx wrangler secret put GIT_TOKEN   # the push password
+```
+
+Then push anything:
+
+```sh
+git remote add origin https://<your-host>/myrepo.git
+git push -u origin main
+```
+
+A Workers request is bounded at 128MB of memory and five minutes of
+CPU, so a very large history lands as a series of smaller pushes rather
+than one; day-to-day pushes, clones, and fetches fit comfortably. A
+full-history clone of a repository with millions of objects can exceed
+the CPU bound — shallow and incremental fetches of the same repository
+are fine.
+
+## Self-host on celld
+
+celld runs the same Worker against a bucket you own, with none of the
+managed platform's request bounds. Set a real `GIT_TOKEN` var in
+`wrangler.celld.jsonc` first:
+
+```sh
+celld deploy wrangler.celld.jsonc --bucket s3://my-cells --endpoint https://...
+CELLD_V8_HEAP_LIMIT_MB=4096 CELLD_LTX_DURABILITY_TIMEOUT_SECS=180 \
+celld --bucket s3://my-cells --endpoint https://... \
+  --listen 0.0.0.0:8080 --internal-listen 10.0.0.1:8081 --advertise 10.0.0.1:8081
+```
+
+Each repository's SQLite database replicates to the bucket; nodes are
+disposable, and a killed node's repositories come back bit-identical.
+The heap and durability-deadline variables give large single-cell
+ingests the room the defaults do not.
+
+## Operate
+
+```sh
+curl -X PUT  -u x:$GIT_TOKEN -d '{"description":"...","section":"tools","private":false}' \
+  https://<host>/myrepo/config                       # describe and place a repository
+curl -X POST -u x:$GIT_TOKEN https://<host>/myrepo/gc    # prune unreachable objects
+curl -X DELETE -u x:$GIT_TOKEN https://<host>/myrepo     # delete a repository
+```
+
+Garbage collection also runs by itself, from a Durable Object alarm,
+after a forced update or a ref deletion. `GIT_TOKENS` holds additional
+comma-separated tokens; `MAX_PUSH_MB` caps a single push.
+
+## Contributions
+
+Pull requests are disabled. Send a `git format-patch` attachment to [me@littledivy.com](mailto:me@littledivy.com).

@@ -1,0 +1,31 @@
+{
+  // dgit: a cgit-style git host that runs entirely on Cloudflare.
+  // Each repository lives in its own SQLite-backed Durable Object ("cell").
+  // NOTE: the script name stays "git-cells" — Durable Object data is bound
+  // to it, and renaming would orphan every hosted repository.
+  "name": "git-cells",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "routes": [
+    { "pattern": "git.littledivy.com", "custom_domain": true }
+  ],
+  "limits": {
+    // pack indexing of a large push is CPU-bound; 5 minutes is the paid-plan max
+    "cpu_ms": 300000
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "REPO", "class_name": "RepoCell" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RepoCell", "Registry"] }
+  ],
+  "vars": {
+    "SITE_NAME": "git.littledivy.com",
+    "SITE_DESC": "a fast webinterface for the git dscm, on Cloudflare",
+    "SITE_OWNER": "divy"
+  }
+  // Push auth: run `wrangler secret put GIT_TOKEN` (use .dev.vars locally).
+}

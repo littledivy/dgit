@@ -1,0 +1,491 @@
+import { concat, isOid, ZERO_OID, te } from "./util";
+import { pkt, FLUSH, PktParser } from "./pktline";
+import { GitStore } from "./store";
+import { PackWriter } from "./pack";
+import { OidSet } from "./oidset";
+import { parseCommit, parseTag, parseTree, isGitlinkMode, TYPE_NUM } from "./objects";
+
+const AGENT = "agent=dgit/0.3";
+const INFINITE_DEPTH = 0x7fffffff;
+const SIDEBAND_CHUNK = 32 * 1024;
+const WALK_YIELD = 5000;
+
+export type Service = "git-upload-pack" | "git-receive-pack";
+
+/** GET /info/refs?service=... — smart ref advertisement (protocol v0). */
+export function advertisement(store: GitStore, service: Service): Uint8Array {
+  const caps =
+    service === "git-upload-pack"
+      ? ["shallow", "side-band-64k", `symref=HEAD:${store.head()}`, AGENT].join(" ")
+      : ["report-status", "delete-refs", "ofs-delta", "side-band-64k", AGENT].join(" ");
+
+  const lines: Uint8Array[] = [pkt(`# service=${service}\n`), FLUSH];
+  const refs: { name: string; target: string }[] = [];
+  if (service === "git-upload-pack") {
+    const head = store.resolveHead();
+    if (head) refs.push({ name: "HEAD", target: head });
+  }
+  refs.push(...store.refs());
+
+  if (refs.length === 0) {
+    lines.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+  } else {
+    refs.forEach((r, i) => {
+      lines.push(pkt(i === 0 ? `${r.target} ${r.name}\0${caps}\n` : `${r.target} ${r.name}\n`));
+    });
+  }
+  lines.push(FLUSH);
+  return concat(lines);
+}
+
+export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] {
+  const frames: Uint8Array[] = [];
+  for (let off = 0; off < payload.length; off += SIDEBAND_CHUNK) {
+    const chunk = payload.subarray(off, off + SIDEBAND_CHUNK);
+    const framed = new Uint8Array(chunk.length + 1);
+    framed[0] = band;
+    framed.set(chunk, 1);
+    frames.push(pkt(framed));
+  }
+  return frames;
+}
+
+interface UploadRequest {
+  wants: string[];
+  haves: string[];
+  done: boolean;
+  clientShallows: string[];
+  deepen: number; // 0 = no depth limit requested
+  caps: Set<string>;
+}
+
+function parseUploadRequest(body: Uint8Array): UploadRequest {
+  const parser = new PktParser(body);
+  const req: UploadRequest = {
+    wants: [],
+    haves: [],
+    done: false,
+    clientShallows: [],
+    deepen: 0,
+    caps: new Set(),
+  };
+  for (let p = parser.read(); p !== null; p = parser.read()) {
+    if (p.kind !== "line") continue;
+    const line = p.text;
+    if (line.startsWith("want ")) {
+      req.wants.push(line.slice(5, 45));
+      // capabilities ride on the first want line
+      for (const cap of line.slice(45).trim().split(" ")) if (cap) req.caps.add(cap);
+    } else if (line.startsWith("have ")) {
+      req.haves.push(line.slice(5, 45));
+    } else if (line.startsWith("shallow ")) {
+      req.clientShallows.push(line.slice(8, 48));
+    } else if (line.startsWith("deepen ")) {
+      req.deepen = parseInt(line.slice(7), 10) || 0;
+    } else if (line === "done") {
+      req.done = true;
+    }
+  }
+  return req;
+}
+
+/** Follow tag objects down to the underlying commit oid (or null). */
+function peelToCommitOid(store: GitStore, oid: string): string | null {
+  for (let i = 0; i < 10; i++) {
+    const obj = store.get(oid);
+    if (!obj) return null;
+    if (obj.type === "commit") return oid;
+    if (obj.type === "tag") {
+      oid = parseTag(obj.data).object;
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Depth-limited commit set from the wants (BFS, min depth wins; the tip is
+ * depth 1, like git). Boundary commits are included but their parents cut.
+ */
+function computeDepthSet(
+  store: GitStore,
+  wants: string[],
+  depth: number
+): { commits: Set<string>; boundary: Set<string> } {
+  const commits = new Set<string>();
+  const boundary = new Set<string>();
+  const queue: { oid: string; depth: number }[] = [];
+  for (const w of wants) {
+    const c = peelToCommitOid(store, w);
+    if (c && !commits.has(c)) {
+      commits.add(c);
+      queue.push({ oid: c, depth: 1 });
+    }
+  }
+  while (queue.length) {
+    const { oid, depth: d } = queue.shift()!;
+    const obj = store.get(oid);
+    if (obj?.type !== "commit") continue;
+    const parents = parseCommit(obj.data).parents;
+    if (d >= depth) {
+      if (parents.length) boundary.add(oid);
+      continue;
+    }
+    boundary.delete(oid); // reachable within depth via this (shorter) path
+    for (const p of parents) {
+      if (!commits.has(p) && store.has(p)) {
+        commits.add(p);
+        queue.push({ oid: p, depth: d + 1 });
+      }
+    }
+  }
+  return { commits, boundary };
+}
+
+/**
+ * Everything the client already has: closure of its haves, cut at its
+ * shallow boundaries (a shallow client does NOT have the parents of its
+ * shallow commits, nor their trees).
+ */
+async function excludedObjects(
+  store: GitStore,
+  haves: string[],
+  clientShallows: string[]
+): Promise<OidSet> {
+  const shallowStops = new Set(clientShallows);
+  const excluded = new OidSet(haves.length * 64);
+  const commitStack: string[] = [];
+  let ops = 0;
+  const yieldMaybe = async () => {
+    if (++ops % WALK_YIELD === 0) await new Promise((r) => setTimeout(r, 0));
+  };
+  for (const h of haves) {
+    if (store.has(h) && excluded.addHex(h)) commitStack.push(h);
+  }
+  const trees: string[] = [];
+  while (commitStack.length) {
+    const oid = commitStack.pop()!;
+    const obj = store.get(oid);
+    if (!obj) continue;
+    await yieldMaybe();
+    if (obj.type === "tag") {
+      const t = parseTag(obj.data).object;
+      if (t && store.has(t) && excluded.addHex(t)) commitStack.push(t);
+      continue;
+    }
+    if (obj.type !== "commit") continue;
+    const c = parseCommit(obj.data);
+    if (excluded.addHex(c.tree)) trees.push(c.tree);
+    if (shallowStops.has(oid)) continue; // client's history stops here
+    for (const p of c.parents) {
+      if (store.has(p) && excluded.addHex(p)) commitStack.push(p);
+    }
+  }
+  while (trees.length) {
+    const oid = trees.pop()!;
+    const obj = store.get(oid);
+    if (obj?.type !== "tree") continue;
+    await yieldMaybe();
+    for (const e of parseTree(obj.data)) {
+      if (isGitlinkMode(e.mode)) continue;
+      if (excluded.addHex(e.oid) && store.typeAndSize(e.oid)?.type === "tree") trees.push(e.oid);
+    }
+  }
+  return excluded;
+}
+
+/**
+ * Objects to pack: closure of wants, minus excluded, cut at commitLimit.
+ * An excluded commit is not re-sent, but the walk still descends through
+ * its parents: with a shallow client, commits BELOW its boundary are not
+ * excluded and must be reachable even when the walk enters via commits the
+ * client already has (deepen and unshallow fetches). Blobs are added by
+ * type lookup alone — their content is never inflated during the walk.
+ */
+async function collectPackOids(
+  store: GitStore,
+  wants: string[],
+  excluded: OidSet,
+  commitLimit: Set<string> | null
+): Promise<OidSet> {
+  const send = new OidSet(4096);
+  const visited = new OidSet(4096);
+  const stack = [...wants];
+  let ops = 0;
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (!visited.addHex(oid)) continue;
+    if (++ops % WALK_YIELD === 0) await new Promise((r) => setTimeout(r, 0));
+    const meta = store.typeAndSize(oid);
+    if (!meta) throw new Error(`missing object ${oid}`);
+    if (meta.type === "commit" && commitLimit && !commitLimit.has(oid)) continue;
+    if (excluded.hasHex(oid)) {
+      if (meta.type === "commit") {
+        const full = store.get(oid)!;
+        stack.push(...parseCommit(full.data).parents);
+      }
+      continue;
+    }
+    send.addHex(oid);
+    if (meta.type === "blob") continue; // leaf: membership only
+    const full = store.get(oid)!;
+    if (full.type === "commit") {
+      const c = parseCommit(full.data);
+      stack.push(c.tree, ...c.parents);
+    } else if (full.type === "tag") {
+      const t = parseTag(full.data);
+      if (t.object) stack.push(t.object);
+    } else if (full.type === "tree") {
+      for (const e of parseTree(full.data)) {
+        if (!isGitlinkMode(e.mode)) stack.push(e.oid);
+      }
+    }
+  }
+  return send;
+}
+
+/**
+ * POST /git-upload-pack — stateless protocol v0 with single-ack negotiation,
+ * shallow (--depth) support, side-band-64k, and a streamed pack response.
+ * Stored pack entries are copied verbatim (deltas preserved) whenever their
+ * base ships in the same pack; everything else is inflated and re-deflated.
+ */
+export async function uploadPack(store: GitStore, body: Uint8Array): Promise<Response> {
+  const headers = {
+    "content-type": "application/x-git-upload-pack-result",
+    "cache-control": "no-cache",
+  };
+  const req = parseUploadRequest(body);
+  if (!req.wants.length || req.wants.some((w) => !isOid(w))) {
+    return new Response(pkt("ERR no valid wants\n") as unknown as BodyInit, { headers });
+  }
+  for (const w of req.wants) {
+    if (!store.has(w)) {
+      return new Response(pkt(`ERR upload-pack: not our ref ${w}\n`) as unknown as BodyInit, { headers });
+    }
+  }
+
+  const preamble: Uint8Array[] = [];
+
+  // shallow section (only when the client asked to deepen)
+  let commitLimit: Set<string> | null = null;
+  if (req.deepen > 0) {
+    const clientShallowSet = new Set(req.clientShallows);
+    if (req.deepen >= INFINITE_DEPTH) {
+      // --unshallow: full history, everything the client thought was shallow opens up
+      for (const s of req.clientShallows) {
+        if (store.has(s)) preamble.push(pkt(`unshallow ${s}\n`));
+      }
+    } else {
+      const { commits, boundary } = computeDepthSet(store, req.wants, req.deepen);
+      commitLimit = commits;
+      for (const b of boundary) {
+        if (!clientShallowSet.has(b)) preamble.push(pkt(`shallow ${b}\n`));
+      }
+      for (const s of req.clientShallows) {
+        if (commits.has(s) && !boundary.has(s)) preamble.push(pkt(`unshallow ${s}\n`));
+      }
+    }
+    preamble.push(FLUSH);
+  }
+
+  // single-ack negotiation: ACK the first common object, else NAK. A round
+  // with neither haves nor done (shallow discovery) gets no ack line at all —
+  // a stray NAK would desync the client's stateless response stream.
+  const firstCommon = req.haves.find((h) => isOid(h) && store.has(h));
+  if (req.done || req.haves.length) {
+    preamble.push(pkt(firstCommon ? `ACK ${firstCommon}\n` : "NAK\n"));
+  }
+
+  if (!req.done) {
+    // negotiation round only — client will POST again
+    return new Response(concat(preamble) as unknown as BodyInit, { headers });
+  }
+
+  const excluded = await excludedObjects(store, req.haves, req.clientShallows);
+  const send = await collectPackOids(store, req.wants, excluded, commitLimit);
+  const sideband = req.caps.has("side-band-64k");
+  const noProgress = req.caps.has("no-progress");
+
+  // stream the pack: preamble, then pack bytes (side-band framed if negotiated)
+  const pending: Uint8Array[] = [concat(preamble)];
+  let buffered: Uint8Array[] = [];
+  let bufferedLen = 0;
+  const flushBuffered = () => {
+    if (!bufferedLen) return;
+    const payload = concat(buffered);
+    buffered = [];
+    bufferedLen = 0;
+    if (sideband) pending.push(...sidebandFrames(1, payload));
+    else pending.push(payload);
+  };
+  const writer = new PackWriter((chunk) => {
+    buffered.push(chunk);
+    bufferedLen += chunk.length;
+    if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
+  });
+
+  let i = 0;
+  let finished = false;
+  const total = send.size;
+  const stream = new ReadableStream<Uint8Array>({
+    start: (ctrl) => {
+      if (sideband && !noProgress) {
+        pending.push(...sidebandFrames(2, te.encode(`Enumerating objects: ${total}, done.\n`)));
+      }
+      writer.header(total);
+      for (const c of pending) ctrl.enqueue(c);
+      pending.length = 0;
+    },
+    pull: (ctrl) => {
+      try {
+        for (let n = 0; n < 64 && i < total; n++, i++) {
+          const oid = send.atHex(i);
+          const entry = store.packs.lookup(oid);
+          if (entry && !entry.baseOid) {
+            writer.rawFull(entry.type, entry.entrySize, store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+          } else if (entry && entry.baseOid && send.hasHex(entry.baseOid)) {
+            writer.rawDelta(entry.entrySize, entry.baseOid, store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+          } else {
+            const obj = store.get(oid);
+            if (!obj) throw new Error(`missing object ${oid}`);
+            writer.object(obj.type, obj.data);
+          }
+        }
+        if (i >= total && !finished) {
+          finished = true;
+          writer.finish();
+          flushBuffered();
+          if (sideband) pending.push(FLUSH);
+        } else {
+          flushBuffered();
+        }
+        for (const c of pending) ctrl.enqueue(c);
+        pending.length = 0;
+        if (finished) ctrl.close();
+      } catch (err) {
+        ctrl.error(err);
+      }
+    },
+    cancel: () => {
+      // client went away mid-transfer (e.g. negotiation round abort); nothing to clean up
+    },
+  });
+  return new Response(stream, { headers });
+}
+
+/** Is `anc` an ancestor of (or equal to) `desc`? Bounded walk. */
+export function isAncestor(store: GitStore, anc: string, desc: string): boolean {
+  if (anc === desc) return true;
+  const seen = new Set<string>([desc]);
+  const stack = [desc];
+  let visited = 0;
+  while (stack.length && visited++ < 10000) {
+    const obj = store.get(stack.pop()!);
+    if (obj?.type !== "commit") continue;
+    for (const p of parseCommit(obj.data).parents) {
+      if (p === anc) return true;
+      if (!seen.has(p)) {
+        seen.add(p);
+        stack.push(p);
+      }
+    }
+  }
+  return false;
+}
+
+export interface PushCommand {
+  old: string;
+  next: string;
+  ref: string;
+}
+
+export interface CommandResult {
+  ref: string;
+  ok: boolean;
+  msg?: string;
+}
+
+/** Parse the command section of a receive-pack request (already buffered). */
+export function parsePushCommands(section: Uint8Array): { commands: PushCommand[]; caps: string[] } {
+  const parser = new PktParser(section);
+  const commands: PushCommand[] = [];
+  let caps: string[] = [];
+  for (let p = parser.read(); p !== null; p = parser.read()) {
+    if (p.kind === "flush") break;
+    if (p.kind !== "line") continue;
+    let line = p.text;
+    const nul = line.indexOf("\0");
+    if (nul !== -1) {
+      caps = line.slice(nul + 1).trim().split(" ");
+      line = line.slice(0, nul);
+    }
+    const m = line.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (.+)$/);
+    if (m) commands.push({ old: m[1], next: m[2], ref: m[3] });
+  }
+  return { commands, caps };
+}
+
+/** Apply ref updates after the pack (if any) has been ingested. */
+export function applyPushCommands(
+  store: GitStore,
+  commands: PushCommand[],
+  unpackError: string | null
+): { results: CommandResult[]; changed: boolean; needsGc: boolean } {
+  const results: CommandResult[] = [];
+  let changed = false;
+  let needsGc = false;
+  for (const cmd of commands) {
+    if (unpackError) {
+      results.push({ ref: cmd.ref, ok: false, msg: "unpacker error" });
+      continue;
+    }
+    if (!cmd.ref.startsWith("refs/") || cmd.ref.includes("..") || /[\s~^:?*\[\\]/.test(cmd.ref)) {
+      results.push({ ref: cmd.ref, ok: false, msg: "funny refname" });
+      continue;
+    }
+    const current = store.getRef(cmd.ref) ?? ZERO_OID;
+    if (current !== cmd.old) {
+      results.push({ ref: cmd.ref, ok: false, msg: "fetch first" });
+      continue;
+    }
+    if (cmd.next === ZERO_OID) {
+      store.delRef(cmd.ref);
+      needsGc = true;
+    } else {
+      if (!store.has(cmd.next)) {
+        results.push({ ref: cmd.ref, ok: false, msg: "missing necessary objects" });
+        continue;
+      }
+      if (cmd.old !== ZERO_OID && !isAncestor(store, cmd.old, cmd.next)) {
+        needsGc = true; // forced update strands old history
+      }
+      store.setRef(cmd.ref, cmd.next);
+    }
+    changed = true;
+    results.push({ ref: cmd.ref, ok: true });
+  }
+
+  // keep HEAD pointing at a branch that exists (first push wins, prefer main/master)
+  if (changed && store.getRef(store.head()) === null) {
+    const branches = store.refs().filter((r) => r.name.startsWith("refs/heads/"));
+    const preferred =
+      branches.find((b) => b.name === "refs/heads/main") ??
+      branches.find((b) => b.name === "refs/heads/master") ??
+      branches[0];
+    if (preferred) store.setHead(preferred.name);
+  }
+  return { results, changed, needsGc };
+}
+
+/** report-status payload; ends with its own flush (nested inside band 1 when sidebanded). */
+export function renderStatus(results: CommandResult[], unpackError: string | null, sideband: boolean): Uint8Array {
+  const lines: Uint8Array[] = [pkt(unpackError ? `unpack ${unpackError}\n` : "unpack ok\n")];
+  for (const r of results) {
+    lines.push(pkt(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.msg}\n`));
+  }
+  lines.push(FLUSH);
+  if (!sideband) return concat(lines);
+  return concat([...sidebandFrames(1, concat(lines)), FLUSH]);
+}
