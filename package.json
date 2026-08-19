@@ -1,8 +1,30 @@
 {
-  "name": "dgit",
-  "version": "0.1.0",
-  "private": true,
+  "name": "durable-git",
+  "version": "0.0.4",
+  "description": "Durable git: a git server as a Cloudflare Durable Object. Smart HTTP, a cgit-style web interface, pluggable auth, push events, and a typed content API.",
   "type": "module",
+  "main": "src/mod.ts",
+  "types": "src/mod.ts",
+  "exports": {
+    ".": "./src/mod.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "git",
+    "cloudflare-workers",
+    "durable-objects",
+    "cgit",
+    "git-server"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/littledivy/dgit.git"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
