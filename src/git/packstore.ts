@@ -1,10 +1,10 @@
 import pako from "pako";
 import { td, concat, toHex, Sha1 } from "./util";
+import { Sha1Dc, Sha1CollisionError } from "./sha1";
 import { ObjType, NUM_TYPE, objectHeader } from "./objects";
 import { applyDelta } from "./pack";
 
 export const PACK_CHUNK = 1024 * 1024;
-const SUBTLE_THRESHOLD = 256 * 1024;
 /** real Workers isolates have a hard 128MB total; self-hosted celld nodes run multi-GB heaps */
 const TIGHT_MEMORY = typeof caches !== "undefined";
 const MAX_BUFFERED_ENTRY = (TIGHT_MEMORY ? 8 : 32) * 1024 * 1024;
@@ -12,6 +12,20 @@ const MAX_BUFFERED_ENTRY = (TIGHT_MEMORY ? 8 : 32) * 1024 * 1024;
 const CACHE_ENTRY_LIMIT = (TIGHT_MEMORY ? 2 : 4) * 1024 * 1024;
 /** recent entry offsets kept in memory for ofs-delta base resolution */
 const OFFSET_WINDOW = 150_000;
+/**
+ * Decoded pack chunks kept hot for readRaw. The clone loop reads one object
+ * per call in walk order, so without this every object re-SELECTs and
+ * re-decodes a whole 1MB row. A handful of 1MB chunks covers any delta chain
+ * and the locality of the walk.
+ */
+const RAW_CHUNK_CACHE = TIGHT_MEMORY ? 4 : 8;
+/**
+ * Hard cap on delta base-chain length when resolving an object. git's default
+ * pack depth is 50; 100 leaves generous headroom for legitimately deep packs
+ * while a crafted deeper (or cyclic) chain is rejected instead of overflowing
+ * the stack or looping forever.
+ */
+const MAX_DELTA_DEPTH = 100;
 
 export interface ObjRec {
   type: ObjType;
@@ -62,15 +76,28 @@ export class ObjCache {
 }
 
 // ingest is strictly sequential, so scratch hashers serve every object
-const scratchSha = new Sha1();
-const streamSha = new Sha1();
+const scratchSha = new Sha1Dc();
+const streamSha = new Sha1Dc();
 
+/**
+ * Finish an object hash, refusing anything carrying a SHA-1 collision-attack
+ * block. This is git's post-SHAttered rule: the id is still plain SHA-1, but
+ * an object built to collide never enters the database.
+ */
+function finishOid(h: Sha1Dc): string {
+  const oid = toHex(h.digest());
+  if (h.collision) throw new Sha1CollisionError(oid);
+  return oid;
+}
+
+/**
+ * Every ingested object goes through the collision-detecting hash, so there
+ * is no fast path here: crypto.subtle is ~10x quicker on large blobs but
+ * cannot screen for near-collision blocks, and an attacker would only have to
+ * pad past the threshold to skip the check.
+ */
 async function hashObjectAsync(type: ObjType, data: Uint8Array): Promise<string> {
-  if (data.length >= SUBTLE_THRESHOLD) {
-    const full = concat([objectHeader(type, data.length), data]);
-    return toHex(new Uint8Array(await crypto.subtle.digest("SHA-1", full as BufferSource)));
-  }
-  return toHex(scratchSha.reset().update(objectHeader(type, data.length)).update(data).digest());
+  return finishOid(scratchSha.reset().update(objectHeader(type, data.length)).update(data));
 }
 
 /** Buffered sequential reader over a pack stored as chunk rows. */
@@ -115,6 +142,9 @@ class PackReader {
  * delta compression. This is what lets Linux-sized repos fit and stream.
  */
 export class PackStore {
+  /** LRU of decoded `pack_data` rows, keyed "packId:seq". */
+  private chunks = new Map<string, Uint8Array>();
+
   constructor(private sql: SqlStorage, private extern: ExternalResolver) {
     this.init();
   }
@@ -162,6 +192,7 @@ export class PackStore {
     for (const t of ["pack_meta", "pack_data", "pack_objects", "pack_pending"]) {
       this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
     }
+    this.chunks.clear(); // pack ids restart from 1: cached rows would be stale
   }
 
   /** Drop all packs and start empty (small-repo gc migrates objects out first). */
@@ -172,6 +203,21 @@ export class PackStore {
 
   countObjects(): number {
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pack_objects").one().n;
+  }
+
+  /** Total stored bytes across all indexed packs (0 when pack-empty). */
+  totalPackBytes(): number {
+    return this.sql.exec<{ n: number }>("SELECT COALESCE(SUM(size), 0) AS n FROM pack_meta").one().n;
+  }
+
+  /**
+   * Bytes of pack storage the raw-chunk LRU keeps hot. A pack no larger than
+   * this fits entirely in cache, so readRaw never re-decodes a chunk no matter
+   * what order objects are emitted in — sorting for read locality is pure
+   * overhead below this threshold.
+   */
+  rawCacheWindow(): number {
+    return RAW_CHUNK_CACHE * PACK_CHUNK;
   }
 
   lookup(oid: string): PackedEntry | null {
@@ -199,6 +245,14 @@ export class PackStore {
     return rows[0] ?? null;
   }
 
+  /** Distinct delta-base oids: a second reference edge gc must not sever. */
+  baseOids(): string[] {
+    return this.sql
+      .exec<{ base_oid: string }>("SELECT DISTINCT base_oid FROM pack_objects WHERE base_oid IS NOT NULL")
+      .toArray()
+      .map((r) => r.base_oid);
+  }
+
   findOidPrefix(prefix: string): string[] {
     return this.sql
       .exec<{ oid: string }>("SELECT oid FROM pack_objects WHERE oid LIKE ? LIMIT 2", prefix + "%")
@@ -216,15 +270,7 @@ export class PackStore {
     const last = Math.floor((off + len - 1) / PACK_CHUNK);
     const out = new Uint8Array(len);
     for (let seq = first; seq <= last; seq++) {
-      const rows = this.sql
-        .exec<{ data: ArrayBuffer }>(
-          "SELECT data FROM pack_data WHERE pack_id = ? AND seq = ?",
-          packId,
-          seq
-        )
-        .toArray();
-      if (!rows.length) continue;
-      const chunk = new Uint8Array(rows[0].data);
+      const chunk = this.chunk(packId, seq);
       const chunkStart = seq * PACK_CHUNK;
       const from = Math.max(off, chunkStart);
       const to = Math.min(off + len, chunkStart + chunk.length);
@@ -233,22 +279,87 @@ export class PackStore {
     return out;
   }
 
-  /** Inflate + delta-resolve an object out of pack storage. */
+  /**
+   * One decoded `pack_data` row, through the LRU. Rows are immutable once
+   * written — a pack chunk is inserted exactly once and only ever removed
+   * wholesale (wipe/reset, or the orphan sweep at the top of ingest, both of
+   * which clear the cache), so a hit can never be stale.
+   */
+  private chunk(packId: number, seq: number): Uint8Array {
+    const key = `${packId}:${seq}`;
+    const hit = this.chunks.get(key);
+    if (hit) {
+      this.chunks.delete(key); // reinsert: most-recently-used goes last
+      this.chunks.set(key, hit);
+      return hit;
+    }
+    const rows = this.sql
+      .exec<{ data: ArrayBuffer }>(
+        "SELECT data FROM pack_data WHERE pack_id = ? AND seq = ?",
+        packId,
+        seq
+      )
+      .toArray();
+    if (!rows.length) throw new Error(`pack ${packId}: missing chunk ${seq}`);
+    const chunk = new Uint8Array(rows[0].data);
+    this.chunks.set(key, chunk);
+    while (this.chunks.size > RAW_CHUNK_CACHE) {
+      this.chunks.delete(this.chunks.keys().next().value as string);
+    }
+    return chunk;
+  }
+
+  /**
+   * Inflate + delta-resolve an object out of pack storage. A crafted pack can
+   * chain deltas arbitrarily deep or in a cycle, so the base chain is walked
+   * ITERATIVELY (not recursively) through cheap index lookups first — bounding
+   * the chain length and detecting cycles before a single delta is inflated —
+   * then applied from the base upward, holding at most two inflated buffers at
+   * a time. This caps both stack depth and peak memory regardless of input.
+   */
   getObject(oid: string, cache: ObjCache): ObjRec | null {
     const cached = cache.get(oid);
     if (cached) return cached;
-    const entry = this.lookup(oid);
-    if (!entry) return null;
-    const raw = pako.inflate(this.readRaw(entry.packId, entry.dataOff, entry.dataLen));
-    let obj: ObjRec;
-    if (entry.baseOid) {
-      const base = this.getObject(entry.baseOid, cache) ?? this.extern(entry.baseOid);
-      if (!base) throw new Error(`missing delta base ${entry.baseOid} for ${oid}`);
-      obj = { type: base.type, data: applyDelta(base.data, raw) };
-    } else {
-      obj = { type: entry.type, data: raw };
+    const first = this.lookup(oid);
+    if (!first) return null;
+
+    // walk to the base via lookups only: collect the delta entries, resolve
+    // where the chain bottoms out (a full entry, a cached object, or a thin
+    // base from another pack / loose storage).
+    const chain: PackedEntry[] = [];
+    const seen = new Set<string>();
+    let base: ObjRec | null = null;
+    let cur: PackedEntry = first;
+    for (;;) {
+      if (seen.has(cur.oid)) throw new Error(`cyclic delta chain at ${cur.oid}`);
+      seen.add(cur.oid);
+      if (!cur.baseOid) {
+        base = { type: cur.type, data: pako.inflate(this.readRaw(cur.packId, cur.dataOff, cur.dataLen)) };
+        break;
+      }
+      if (chain.length >= MAX_DELTA_DEPTH) throw new Error(`delta chain exceeds depth ${MAX_DELTA_DEPTH} at ${oid}`);
+      chain.push(cur);
+      const cachedBase = cache.get(cur.baseOid);
+      if (cachedBase) { base = cachedBase; break; }
+      const next = this.lookup(cur.baseOid);
+      if (!next) {
+        const ext = this.extern(cur.baseOid);
+        if (!ext) throw new Error(`missing delta base ${cur.baseOid} for ${cur.oid}`);
+        base = ext;
+        break;
+      }
+      cur = next;
     }
-    cache.put(oid, obj);
+
+    // apply deltas from the base upward (chain is target..base order)
+    let obj = base;
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const d = chain[i];
+      const delta = pako.inflate(this.readRaw(d.packId, d.dataOff, d.dataLen));
+      obj = { type: base.type, data: applyDelta(obj.data, delta) };
+      cache.put(d.oid, obj);
+    }
+    if (!chain.length) cache.put(oid, obj);
     return obj;
   }
 
@@ -283,6 +394,9 @@ export class PackStore {
         this.sql.exec(`DELETE FROM ${t} WHERE pack_id = ?`, o.pack_id);
       }
     }
+    // the reclaimed pack id is about to be handed out again: drop anything the
+    // chunk LRU still holds for it (and for anything else — it is only a cache)
+    if (orphans.length) this.chunks.clear();
     const packId =
       (this.sql.exec<{ m: number | null }>("SELECT MAX(pack_id) AS m FROM pack_meta").one().m ?? 0) + 1;
     const started = Date.now();
@@ -472,7 +586,7 @@ export class PackStore {
           content = pieces.length === 1 ? pieces[0] : concat(pieces);
           oid = await hashObjectAsync(objType!, content);
         } else {
-          oid = toHex(streamSha.digest());
+          oid = finishOid(streamSha);
         }
         insertObject([oid, packId, offset, dataOff, dataLen, objType!, entrySize, entrySize, null]);
         winPut(offset, oid);
@@ -516,6 +630,9 @@ export class PackStore {
         if (i % 100000 === 99999) say(`Indexing objects: ${i + 1}/${count}\n`);
       }
     }
+    // the header count must account for every byte up to the 20-byte trailer;
+    // otherwise objects were silently dropped (or junk trails the pack)
+    if (r.pos !== total - 20) throw new Error("pack has trailing data or bad object count");
     await opts.flush?.();
     say(`Indexed ${count} objects (${pendingCount} deferred)\n`);
 

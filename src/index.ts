@@ -22,24 +22,96 @@ function unauthorized(): Response {
   });
 }
 
-/** HTTP Basic where the password (or username) is one of the configured tokens. */
-function checkAuth(req: Request, env: Env): Response | null {
+function tooManyRequests(retryAfterMs: number): Response {
+  return new Response("too many failed attempts\n", {
+    status: 429,
+    headers: { "retry-after": String(Math.ceil(retryAfterMs / 1000)) },
+  });
+}
+
+async function digest(s: string): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+}
+
+/** Fixed-length SHA-256 digests, so this leaks nothing about input length. */
+function digestsEqual(a: Uint8Array, b: Uint8Array): boolean {
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
+
+function clientIp(req: Request): string {
+  return (
+    req.headers.get("cf-connecting-ip") ??
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    "unknown"
+  );
+}
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_MAX_IPS = 5000;
+const authFailures = new Map<string, { count: number; resetAt: number }>();
+
+function pruneAuthFailures(now: number): void {
+  if (authFailures.size <= RATE_LIMIT_MAX_IPS) return;
+  for (const [ip, e] of authFailures) {
+    if (e.resetAt <= now) authFailures.delete(ip);
+  }
+  while (authFailures.size > RATE_LIMIT_MAX_IPS) {
+    const oldest = authFailures.keys().next().value;
+    if (oldest === undefined) break;
+    authFailures.delete(oldest);
+  }
+}
+
+function rateLimited(ip: string): number | null {
+  const e = authFailures.get(ip);
+  if (!e || e.resetAt <= Date.now()) return null;
+  return e.count >= RATE_LIMIT_MAX ? e.resetAt - Date.now() : null;
+}
+
+function recordAuthFailure(ip: string): void {
+  const now = Date.now();
+  const e = authFailures.get(ip);
+  if (!e || e.resetAt <= now) {
+    authFailures.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+  } else {
+    e.count++;
+  }
+  pruneAuthFailures(now);
+}
+
+/** HTTP Basic where the password (only) is one of the configured tokens. */
+async function checkAuth(req: Request, env: Env): Promise<Response | null> {
   const valid = tokens(env);
   if (!valid.length) {
     return new Response("access is disabled: set the GIT_TOKEN secret\n", { status: 403 });
   }
   const header = req.headers.get("authorization") ?? "";
   if (!header.startsWith("Basic ")) return unauthorized();
-  let user = "", pass = "";
+
+  const ip = clientIp(req);
+  const retryMs = rateLimited(ip);
+  if (retryMs !== null) return tooManyRequests(retryMs);
+
+  let pass = "";
   try {
     const decoded = atob(header.slice(6));
     const colon = decoded.indexOf(":");
-    user = colon === -1 ? decoded : decoded.slice(0, colon);
     pass = colon === -1 ? "" : decoded.slice(colon + 1);
   } catch {
+    recordAuthFailure(ip);
     return unauthorized();
   }
-  if (!valid.includes(pass) && !valid.includes(user)) return unauthorized();
+
+  const passDigest = await digest(pass);
+  let ok = false;
+  for (const v of valid) ok = digestsEqual(passDigest, await digest(v)) || ok;
+  if (!ok) {
+    recordAuthFailure(ip);
+    return unauthorized();
+  }
   return null;
 }
 
@@ -55,7 +127,7 @@ function siteBase(env: Env) {
 
 async function indexPage(env: Env): Promise<Response> {
   const registry = env.REGISTRY.getByName("registry");
-  const repos = (await registry.list()).filter((r) => !r.priv);
+  const repos = await registry.list();
   let rows = "";
   let lastSection: string | null = null;
   for (const r of repos) {
@@ -83,16 +155,29 @@ ${rows || "<tr class='nohover'><td colspan='4'>no repositories yet &mdash; creat
  * Per-isolate memo of registry lookups. Without it every page view — cache
  * hit or not — funnels through the single Registry DO, which becomes the
  * global bottleneck under a traffic spike. Staleness window is small and
- * only affects metadata (descriptions, versions, the private flag).
+ * only affects metadata (descriptions, versions, the private flag). Bounded
+ * and short-TTL'd on misses so enumerating random repo names can't grow it
+ * unbounded.
  */
 const infoMemo = new Map<string, { at: number; info: RepoInfo | null }>();
 const INFO_TTL_MS = 20_000;
+const INFO_NEG_TTL_MS = 2_000;
+const INFO_MEMO_MAX = 5000;
+
+function pruneInfoMemo(): void {
+  while (infoMemo.size > INFO_MEMO_MAX) {
+    const oldest = infoMemo.keys().next().value;
+    if (oldest === undefined) break;
+    infoMemo.delete(oldest);
+  }
+}
 
 async function repoInfo(env: Env, repo: string, fresh: boolean): Promise<RepoInfo | null> {
   const hit = infoMemo.get(repo);
-  if (!fresh && hit && Date.now() - hit.at < INFO_TTL_MS) return hit.info;
+  if (!fresh && hit && Date.now() - hit.at < (hit.info ? INFO_TTL_MS : INFO_NEG_TTL_MS)) return hit.info;
   const info = await env.REGISTRY.getByName("registry").get(repo);
   infoMemo.set(repo, { at: Date.now(), info });
+  pruneInfoMemo();
   return info;
 }
 
@@ -165,7 +250,7 @@ export default {
 
     // pushes, admin operations, and everything on a private repo require auth
     if (isReceive || isAdmin || info?.priv) {
-      const denied = checkAuth(req, env);
+      const denied = await checkAuth(req, env);
       if (denied) return denied;
     }
 

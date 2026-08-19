@@ -10,6 +10,22 @@ export interface SnapshotFile {
 }
 
 
+function safePath(p: string): boolean {
+  if (!p || p.startsWith("/") || p.includes("\\")) return false;
+  return p.split("/").every((c) => c !== "" && c !== "." && c !== "..");
+}
+
+function safeTarget(t: string): boolean {
+  if (t.startsWith("/")) return false;
+  return t.split("/").every((c) => c !== "..");
+}
+
+function safeEntry(f: SnapshotFile): boolean {
+  if (!safePath(f.path)) return false;
+  if (f.symlink && !safeTarget(new TextDecoder().decode(f.data))) return false;
+  return true;
+}
+
 function octal(n: number, width: number): Uint8Array {
   const s = n.toString(8).padStart(width - 1, "0") + "\0";
   return te.encode(s);
@@ -49,6 +65,7 @@ function tarHeader(path: string, mode: number, size: number, mtime: number, type
 export function tarGz(prefix: string, files: SnapshotFile[], mtime: number): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const f of files) {
+    if (!safeEntry(f)) continue;
     const path = `${prefix}/${f.path}`;
     if (f.symlink) {
       const target = new TextDecoder().decode(f.data);
@@ -94,6 +111,7 @@ export function zip(prefix: string, files: SnapshotFile[], mtime: number): Uint8
   const central: Uint8Array[] = [];
   let offset = 0;
   for (const f of files) {
+    if (!safeEntry(f)) continue;
     const name = te.encode(`${prefix}/${f.path}`);
     const crc = crc32(f.data);
     const compressed = f.data.length ? pako.deflateRaw(f.data) : new Uint8Array(0);
@@ -136,8 +154,8 @@ export function zip(prefix: string, files: SnapshotFile[], mtime: number): Uint8
   const eocd = new Uint8Array(22);
   const ev = new DataView(eocd.buffer);
   ev.setUint32(0, 0x06054b50, true);
-  ev.setUint16(8, files.length, true);
-  ev.setUint16(10, files.length, true);
+  ev.setUint16(8, central.length, true);
+  ev.setUint16(10, central.length, true);
   ev.setUint32(12, cdLen, true);
   ev.setUint32(16, cdStart, true);
   return concat([...parts, ...central, eocd]);

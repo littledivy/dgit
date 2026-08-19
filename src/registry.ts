@@ -34,6 +34,7 @@ export class Registry extends DurableObject<Env> {
         idle INTEGER NOT NULL DEFAULT 0,
         ver INTEGER NOT NULL DEFAULT 1
       );
+      CREATE INDEX IF NOT EXISTS idx_repos_section_name ON repos (section, name);
     `);
     // upgrade path for databases created by earlier versions
     for (const col of ["section TEXT NOT NULL DEFAULT ''", "priv INTEGER NOT NULL DEFAULT 0", "ver INTEGER NOT NULL DEFAULT 1"]) {
@@ -80,9 +81,13 @@ export class Registry extends DurableObject<Env> {
     return rows[0] ?? null;
   }
 
-  list(): RepoInfo[] {
+  /** Public index page feed: excludes private repos, bounded so a large table can't dump wholesale over RPC. */
+  list(limit = 1000): RepoInfo[] {
     return this.ctx.storage.sql
-      .exec<RepoInfo>("SELECT name, desc, owner, section, priv, idle, ver FROM repos ORDER BY section, name")
+      .exec<RepoInfo>(
+        "SELECT name, desc, owner, section, priv, idle, ver FROM repos WHERE priv = 0 ORDER BY section, name LIMIT ?",
+        limit
+      )
       .toArray();
   }
 }

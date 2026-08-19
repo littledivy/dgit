@@ -3,7 +3,8 @@ import type { Env } from "./env";
 import { td, te, isOid, concat } from "./git/util";
 import { GitStore } from "./git/store";
 import { ObjCache } from "./git/packstore";
-import { gunzip } from "./git/zlib";
+import { OidSet } from "./git/oidset";
+import { gunzipLimited } from "./git/zlib";
 import {
   advertisement,
   uploadPack,
@@ -34,8 +35,20 @@ const LOG_PAGE = 50;
 const MAX_DIFF_FILES = 100;
 const MAX_DIFF_BLOB = 512 * 1024;
 const MAX_LOG_SCAN = 5000;
+/** a path-filtered log rejects most commits, so bound its walk tighter */
+const PATH_LOG_SCAN = 2000;
 const MAX_STATS_SCAN = 2000;
-const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+/** whole-file blame is memory-bound: cap the tip blob and the history bytes */
+const MAX_BLAME_BYTES = 1024 * 1024;
+const MAX_BLAME_HISTORY_BYTES = 16 * 1024 * 1024;
+// full streaming is a separate follow-up; until then this must fit the isolate
+const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+/** the DO SQLite storage ceiling gc must not cross while duplicating objects */
+const DO_STORAGE_CAP = 10 * 1024 * 1024 * 1024;
+/** default push cap when MAX_PUSH_MB is unset, in MiB (matches env.ts docs) */
+const DEFAULT_MAX_PUSH_MB = 512;
+/** an upload-pack request is wants/haves/caps only — a few hundred KB at most */
+const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
 // like cgit's about-file: a dedicated about page wins over the README
 const README_NAMES = [
   "about.md",
@@ -103,17 +116,34 @@ export class RepoCell extends DurableObject<Env> {
         });
       }
       if (path === "/git-upload-pack" && req.method === "POST") {
+        if (overDeclaredLength(req, MAX_UPLOAD_PACK_BYTES)) return tooLargeResponse(MAX_UPLOAD_PACK_BYTES);
         if (this.activeUploads >= 4) {
           return new Response("busy: too many concurrent fetches, retry shortly\n", {
             status: 503,
             headers: { "retry-after": "15" },
           });
         }
+        // the slot must span the whole response stream, not just uploadPack's
+        // return: decrementing when the ReadableStream is handed back — before
+        // a byte is produced — disables admission control and lets celld
+        // idle-evict the cell mid-clone. release() fires exactly once, from the
+        // stream's close/cancel or a non-stream early return.
         this.activeUploads++;
-        try {
-          return await uploadPack(this.store, await this.readBody(req));
-        } finally {
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
           this.activeUploads--;
+        };
+        try {
+          return await uploadPack(this.store, await this.readBody(req), release);
+        } catch (err) {
+          release();
+          // an over-inflating body is the client's fault, not a server error
+          if (err instanceof Error && err.message.includes("exceeds maximum size")) {
+            return tooLargeResponse(MAX_UPLOAD_PACK_BYTES);
+          }
+          throw err;
         }
       }
       if (path === "/git-receive-pack" && req.method === "POST") {
@@ -127,19 +157,22 @@ export class RepoCell extends DurableObject<Env> {
         return this.handleConfig(JSON.stringify({ description: (await req.text()).trim() }));
       }
       if ((path === "/" || path === "") && req.method === "DELETE") {
-        // wipe() drops every table we own; deliberately NOT storage.deleteAll():
-        // on celld, deleteAll sweeps the ltx replication control tables too and
-        // permanently breaks WAL capture for the cell (patch submitted upstream)
-        this.store.wipe();
-        await this.ctx.storage.deleteAlarm();
-        // this instance stays resident: bring the (empty) schema back so
-        // later requests — including a re-creating push — find their tables
-        this.store = new GitStore(this.ctx.storage.sql);
+        // the whole wipe must be atomic: a concurrent request landing between
+        // the table drop and the re-init hits missing tables and 500s
+        await this.ctx.blockConcurrencyWhile(async () => {
+          // wipe() drops every table we own; deliberately NOT storage.deleteAll():
+          // on celld, deleteAll sweeps the ltx replication control tables too and
+          // permanently breaks WAL capture for the cell (patch submitted upstream)
+          this.store.wipe();
+          await this.ctx.storage.deleteAlarm();
+          // this instance stays resident: bring the (empty) schema back so
+          // later requests — including a re-creating push — find their tables
+          this.store = new GitStore(this.ctx.storage.sql);
+        });
         return new Response("deleted\n");
       }
       if (path === "/gc" && req.method === "POST") {
-        const result = this.runGc();
-        return Response.json(result);
+        return Response.json(await this.gc());
       }
 
       if (req.method !== "GET") return new Response("method not allowed\n", { status: 405 });
@@ -151,10 +184,44 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    if (this.store.getMeta("gc-pending") === "1") {
-      this.runGc();
-      this.store.setMeta("gc-pending", "0");
+    if (this.store.getMeta("gc-pending") !== "1") return;
+    // GC calls packs.reset(): running it while a clone is streaming or a push
+    // is ingesting corrupts both. Defer past any in-flight upload (leave
+    // gc-pending set so the re-armed alarm retries) rather than run now.
+    if (this.activeUploads > 0) {
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + 30 * 1000);
+      } catch {
+        // alarm store may be busy under a burst; the next push re-arms it
+      }
+      return;
     }
+    // clear first: at-most-once, so a throwing sweep can't trigger a retry storm
+    this.store.setMeta("gc-pending", "0");
+    try {
+      await this.gc();
+    } catch (err) {
+      console.log("gc failed", String(err));
+    }
+  }
+
+  /**
+   * Run GC serialized against pushes (same receiveChain) and under
+   * blockConcurrencyWhile, so packs.reset() can never land mid-ingest or
+   * mid-clone.
+   */
+  private gc(): Promise<{ removed: number; kept: number; skipped?: boolean }> {
+    let result: { removed: number; kept: number; skipped?: boolean } = { removed: 0, kept: 0 };
+    const run = this.receiveChain.then(() =>
+      this.ctx.blockConcurrencyWhile(async () => {
+        result = this.runGc();
+      })
+    );
+    this.receiveChain = run.then(
+      () => {},
+      () => {}
+    );
+    return run.then(() => result);
   }
 
   private handleConfig(body: string): Response {
@@ -182,19 +249,21 @@ export class RepoCell extends DurableObject<Env> {
    * huge repos skip the sweep entirely — the walk isn't worth it.
    */
   private runGc(): { removed: number; kept: number; skipped?: boolean } {
-    if (this.store.packs.countObjects() > 300_000) {
+    if (this.store.objectCount() > 300_000) {
       return { removed: 0, kept: this.store.objectCount(), skipped: true };
     }
-    const reachable = new Set<string>();
+    const reachable = new OidSet(Math.max(this.store.objectCount(), 4096));
     const stack: string[] = this.store.refs().map((r) => r.target);
     const head = this.store.resolveHead();
     if (head) stack.push(head);
     while (stack.length) {
       const oid = stack.pop()!;
-      if (reachable.has(oid)) continue;
+      if (!reachable.addHex(oid)) continue;
+      const meta = this.store.typeAndSize(oid);
+      if (!meta) continue;
+      if (meta.type === "blob") continue; // leaf: never inflate blob content here
       const obj = this.store.get(oid);
       if (!obj) continue;
-      reachable.add(oid);
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);
         stack.push(c.tree, ...c.parents);
@@ -207,19 +276,25 @@ export class RepoCell extends DurableObject<Env> {
         }
       }
     }
-    let removed = 0;
-    for (const oid of this.store.allOids()) {
-      if (!reachable.has(oid)) {
-        this.store.deleteObject(oid);
-        removed++;
-      }
-    }
-    // repack-by-migration: reachable pack objects move to loose storage,
-    // then the packs (including anything stranded inside them) are dropped
+    // base_oid is a second reference edge: thin-pack deltas point at bases
+    // that are frequently unreachable from any ref. Added after the graph walk
+    // so a base that is itself a reachable tree keeps its own children.
+    for (const b of this.store.packs.baseOids()) reachable.addHex(b);
+
     const packCount = this.store.packs.countObjects();
-    if (packCount > 0) {
+    // migration duplicates every reachable pack object into loose storage
+    // before the packs are dropped: guard against crossing the 10GB DO ceiling
+    // mid-rewrite (which would brick the repo) by leaving the packs intact when
+    // there is no headroom for the copy.
+    const noHeadroom =
+      packCount > 0 && this.store.dbSize() + this.store.packs.totalPackBytes() > DO_STORAGE_CAP;
+    let removed = 0;
+    if (packCount > 0 && !noHeadroom) {
+      // migrate reachable pack objects to loose FIRST, then reset packs, so a
+      // base or reachable object stranded inside a pack survives the drop
       let migrated = 0;
-      for (const oid of reachable) {
+      for (let i = 0; i < reachable.size; i++) {
+        const oid = reachable.atHex(i);
         if (this.store.packs.lookup(oid)) {
           const obj = this.store.get(oid);
           if (obj) {
@@ -231,12 +306,22 @@ export class RepoCell extends DurableObject<Env> {
       removed += packCount - migrated;
       this.store.packs.reset();
     }
-    return { removed, kept: reachable.size };
+    // sweep loose objects (including anything just migrated) unreachable now
+    for (const oid of this.store.allOids()) {
+      if (!reachable.hasHex(oid)) {
+        this.store.deleteObject(oid);
+        removed++;
+      }
+    }
+    return noHeadroom ? { removed, kept: reachable.size, skipped: true } : { removed, kept: reachable.size };
   }
 
   private async readBody(req: Request): Promise<Uint8Array> {
     let body: Uint8Array = new Uint8Array(await req.arrayBuffer());
-    if (req.headers.get("content-encoding")?.includes("gzip")) body = gunzip(body);
+    if (body.length > MAX_UPLOAD_PACK_BYTES) throw new Error("request body exceeds maximum size");
+    if (req.headers.get("content-encoding")?.includes("gzip")) {
+      body = gunzipLimited(body, MAX_UPLOAD_PACK_BYTES);
+    }
     return body;
   }
 
@@ -248,7 +333,10 @@ export class RepoCell extends DurableObject<Env> {
    * retires its isolate) out from under a long ingest.
    */
   private async receive(req: Request, repo: string): Promise<Response> {
-    const maxBytes = (parseInt(this.env.MAX_PUSH_MB ?? "", 10) || 8192) * 1024 * 1024;
+    const maxBytes = (parseInt(this.env.MAX_PUSH_MB ?? "", 10) || DEFAULT_MAX_PUSH_MB) * 1024 * 1024;
+    // refuse an over-sized push from its declared length: buffering it first
+    // and checking after is exactly the memory the limit exists to bound
+    if (overDeclaredLength(req, maxBytes)) return tooLargeResponse(maxBytes);
     const chunks: Uint8Array[] = [];
     // chain: a second push (e.g. a client retry of the same POST) must
     // wait — two interleaved ingests would both claim the next pack id
@@ -264,7 +352,9 @@ export class RepoCell extends DurableObject<Env> {
       await run;
     } catch (err) {
       console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-      return new Response(`error: ${err instanceof Error ? err.message : String(err)}\n`, { status: 500 });
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("exceeds maximum size")) return tooLargeResponse(maxBytes);
+      return new Response(`error: ${msg}\n`, { status: 500 });
     }
     return new Response(concat(chunks) as unknown as BodyInit, {
       headers: {
@@ -284,7 +374,9 @@ export class RepoCell extends DurableObject<Env> {
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let buf: Uint8Array;
     if (req.headers.get("content-encoding")?.includes("gzip")) {
-      buf = gunzip(new Uint8Array(await req.arrayBuffer())); // only small pushes arrive gzipped
+      // only small pushes arrive gzipped, and the inflate is budgeted: a
+      // zlib bomb can no more exceed the push cap than a plain body can
+      buf = gunzipLimited(new Uint8Array(await req.arrayBuffer()), maxBytes);
     } else {
       reader = (req.body?.getReader() as ReadableStreamDefaultReader<Uint8Array>) ?? null;
       buf = new Uint8Array(0);
@@ -353,7 +445,11 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
 
-    const { results, changed, needsGc } = applyPushCommands(this.store, commands, unpackError);
+    // one savepoint around every ref update: a multi-ref push (git push --all)
+    // must not leave half its branches moved if a later update throws
+    const { results, changed, needsGc } = this.ctx.storage.transactionSync(() =>
+      applyPushCommands(this.store, commands, unpackError)
+    );
     if (changed) {
       this.store.setMeta("created", "1");
       this.store.setMeta("last-push", String(Date.now()));
@@ -428,6 +524,53 @@ export class RepoCell extends DurableObject<Env> {
   }
 
 
+  /**
+   * Resolve an object id for the browser's object-serving paths (blob/commit/
+   * diff/patch/tree-by-oid). Only a full 40-char oid that is reachable from a
+   * current ref is served: short-prefix resolution let a force-pushed secret be
+   * brute-forced through the UI even after the protocol side stopped serving
+   * unreachable objects.
+   */
+  private resolveServable(id: string): string | null {
+    if (!isOid(id) || !this.store.has(id)) return null;
+    return this.reachableOid(id) ? id : null;
+  }
+
+  /** Is `target` reachable from any current ref (or HEAD)? */
+  private reachableOid(target: string): boolean {
+    // the full-clone reachable-set cache is versioned against current refs
+    // (null on any mismatch), so a hit here is exactly as correct as the walk
+    // below and skips inflating/parsing the whole object graph
+    const cached = this.store.loadReachable();
+    if (cached) return cached.hasHex(target);
+    const seen = new OidSet(Math.max(this.store.objectCount(), 4096));
+    const stack: string[] = this.store.refs().map((r) => r.target);
+    const head = this.store.resolveHead();
+    if (head) stack.push(head);
+    while (stack.length) {
+      const oid = stack.pop()!;
+      if (oid === target) return true;
+      if (!seen.addHex(oid)) continue;
+      const meta = this.store.typeAndSize(oid);
+      if (!meta) continue;
+      if (meta.type === "blob") continue;
+      const obj = this.store.get(oid);
+      if (!obj) continue;
+      if (obj.type === "commit") {
+        const c = parseCommit(obj.data);
+        stack.push(c.tree, ...c.parents);
+      } else if (obj.type === "tag") {
+        const t = parseTag(obj.data);
+        if (t.object) stack.push(t.object);
+      } else if (obj.type === "tree") {
+        for (const e of parseTree(obj.data)) {
+          if (!isGitlinkMode(e.mode)) stack.push(e.oid);
+        }
+      }
+    }
+    return false;
+  }
+
   /** Resolve ?h= (branch, tag, full ref, or oid) to an object id. */
   private resolveRef(h?: string): { refName: string | null; oid: string } | null {
     if (!h) {
@@ -438,17 +581,30 @@ export class RepoCell extends DurableObject<Env> {
       const oid = this.store.getRef(cand);
       if (oid) return { refName: cand, oid };
     }
-    const full = this.store.findOid(h);
+    const full = this.resolveServable(h);
     if (full) return { refName: null, oid: full };
     return null;
   }
 
-  /** Follow tag objects until we reach a commit. */
+  /**
+   * Follow tag objects until we reach a commit. Tag oids are immutable
+   * content, so a start oid that actually peeled through a tag has its final
+   * commit oid cached — a hit skips every intermediate tag object read.
+   */
   private peelToCommit(oid: string): { oid: string; commit: Commit } | null {
+    const start = oid;
+    const cached = this.store.getPeeled(start);
+    if (cached !== null) {
+      const obj = this.store.get(cached);
+      return obj?.type === "commit" ? { oid: cached, commit: parseCommit(obj.data) } : null;
+    }
     for (let i = 0; i < 10; i++) {
       const obj = this.store.get(oid);
       if (!obj) return null;
-      if (obj.type === "commit") return { oid, commit: parseCommit(obj.data) };
+      if (obj.type === "commit") {
+        if (oid !== start) this.store.setPeeled(start, oid);
+        return { oid, commit: parseCommit(obj.data) };
+      }
       if (obj.type === "tag") {
         oid = parseTag(obj.data).object;
         continue;
@@ -476,11 +632,27 @@ export class RepoCell extends DurableObject<Env> {
     return oid;
   }
 
-  private matchesFilter(e: LogEntry, filter: LogFilter): boolean {
+  /** pathOid keyed by the root tree it starts from: shared across a log walk. */
+  private pathOidCached(treeOid: string, path: string[], memo: Map<string, string | null>): string | null {
+    const hit = memo.get(treeOid);
+    if (hit !== undefined) return hit;
+    let oid: string | null = treeOid;
+    for (const seg of path) {
+      const obj = this.store.get(oid);
+      if (obj?.type !== "tree") { oid = null; break; }
+      const entry = parseTree(obj.data).find((e) => e.name === seg);
+      if (!entry) { oid = null; break; }
+      oid = entry.oid;
+    }
+    memo.set(treeOid, oid);
+    return oid;
+  }
+
+  private matchesFilter(e: LogEntry, filter: LogFilter, memo: Map<string, string | null>): boolean {
     if (filter.path && filter.path.length) {
-      const mine = this.pathOid(e.commit, filter.path);
-      const parent = e.commit.parents[0] ? this.loadCommit(e.commit.parents[0]) : null;
-      const theirs = parent ? this.pathOid(parent, filter.path) : null;
+      const mine = this.pathOidCached(e.commit.tree, filter.path, memo);
+      const parentTree = e.commit.parents[0] ? this.loadCommit(e.commit.parents[0])?.tree : undefined;
+      const theirs = parentTree ? this.pathOidCached(parentTree, filter.path, memo) : null;
       if (mine === theirs) return false;
     }
     if (filter.q) {
@@ -501,14 +673,17 @@ export class RepoCell extends DurableObject<Env> {
   private walkLog(tip: string, skip: number, limit: number, filter: LogFilter = {}): { entries: LogEntry[]; more: boolean } {
     const first = this.peelToCommit(tip);
     if (!first) return { entries: [], more: false };
+    skip = Math.min(skip, MAX_LOG_SCAN); // a wild ofs must not drive the walk to its cap for an empty page
+    const scanCap = filter.path?.length ? PATH_LOG_SCAN : MAX_LOG_SCAN;
+    const memo = new Map<string, string | null>();
     const seen = new Set<string>([first.oid]);
     const frontier: LogEntry[] = [{ oid: first.oid, commit: first.commit }];
     const out: LogEntry[] = [];
     let scanned = 0;
-    while (frontier.length && out.length < skip + limit + 1 && scanned++ < MAX_LOG_SCAN) {
+    while (frontier.length && out.length < skip + limit + 1 && scanned++ < scanCap) {
       frontier.sort((a, b) => b.commit.committer.time - a.commit.committer.time);
       const cur = frontier.shift()!;
-      if (this.matchesFilter(cur, filter)) out.push(cur);
+      if (this.matchesFilter(cur, filter, memo)) out.push(cur);
       for (const p of cur.commit.parents) {
         if (seen.has(p)) continue;
         seen.add(p);
@@ -520,17 +695,23 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** First-parent history of a path (for blame), newest first, with blobs. */
-  private pathHistory(tip: string, path: string[], cap: number): BlameHistoryEntry[] {
+  private pathHistory(tip: string, path: string[], cap: number, maxBytes: number): BlameHistoryEntry[] {
     const out: BlameHistoryEntry[] = [];
     let cur = this.peelToCommit(tip);
     let steps = 0;
+    let bytes = 0;
     while (cur && steps++ < MAX_LOG_SCAN && out.length < cap) {
       const myOid = this.pathOid(cur.commit, path);
       const parent = cur.commit.parents[0] ? this.peelToCommit(cur.commit.parents[0]) : null;
       const parentOid = parent ? this.pathOid(parent.commit, path) : null;
       if (myOid !== parentOid) {
         const blob = myOid ? this.store.get(myOid) : null;
-        out.push({ oid: cur.oid, commit: cur.commit, blob: blob?.type === "blob" ? blob.data : null });
+        const data = blob?.type === "blob" ? blob.data : null;
+        if (data) {
+          bytes += data.length;
+          if (bytes > maxBytes && out.length) break; // bound total blobs held in memory
+        }
+        out.push({ oid: cur.oid, commit: cur.commit, blob: data });
         if (!parentOid) break; // file created here
       }
       cur = parent;
@@ -1008,7 +1189,15 @@ ${rows}
     const rr = this.resolveRef(h);
     if (!rr) return errorPage(withPath, "empty repository");
     if (!path.length) return errorPage(withPath, "blame needs a file path");
-    const history = this.pathHistory(rr.oid, path, 200);
+    // size-gate the tip blob before walking history: a large file would
+    // otherwise load up to 200 full revisions into memory before blame() bails
+    const tip = this.peelToCommit(rr.oid);
+    if (!tip) return errorPage(withPath, "no commit found");
+    const tipOid = this.pathOid(tip.commit, path);
+    const meta = tipOid ? this.store.typeAndSize(tipOid) : null;
+    if (!meta || meta.type !== "blob") return errorPage(withPath, `no such file: ${path.join("/")}`);
+    if (meta.size > MAX_BLAME_BYTES) return errorPage(withPath, "blame skipped: file too large");
+    const history = this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES);
     if (!history.length || !history[0].blob) return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (isBinary(history[0].blob)) return errorPage(withPath, "cannot blame a binary file");
     const result = blame(history);
@@ -1047,7 +1236,7 @@ ${rows}
   }
 
   private blobByIdPage(id: string): Response {
-    const oid = this.store.findOid(id);
+    const oid = this.resolveServable(id);
     if (!oid) return new Response("not found\n", { status: 404 });
     const obj = this.store.get(oid);
     if (!obj || obj.type !== "blob") return new Response("not a blob\n", { status: 404 });
@@ -1083,7 +1272,7 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
 
   private resolveCommitId(id: string | undefined, h: string | undefined): string | null {
     if (id) {
-      const full = this.store.findOid(id);
+      const full = this.resolveServable(id);
       return full ? this.peelToCommit(full)?.oid ?? null : null;
     }
     const rr = this.resolveRef(h);
@@ -1149,7 +1338,7 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
     const r = `/${encodeURIComponent(repo)}`;
     const base = this.base(repo, "refs", undefined, `${r}/refs/`);
     if (!name) return errorPage(base, "no tag given");
-    const target = this.store.getRef(`refs/tags/${name}`) ?? this.store.findOid(name);
+    const target = this.store.getRef(`refs/tags/${name}`) ?? this.resolveServable(name);
     if (!target) return errorPage(base, `tag not found: ${name}`);
     const obj = this.store.get(target);
     if (!obj) return errorPage(base, `missing object`);
@@ -1266,13 +1455,18 @@ ${items}
     return new Response(xml, { headers: { "content-type": "application/atom+xml; charset=utf-8" } });
   }
 
-  private statsPage(repo: string, h: string | undefined, period: string): Response {
-    const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "stats", h, `${r}/stats/`);
-    const rr = this.resolveRef(h);
-    if (!rr) return errorPage(base, "empty repository");
-    const { entries } = this.walkLog(rr.oid, 0, MAX_STATS_SCAN);
-
+  /**
+   * Commit-activity aggregation for a fixed (tip commit oid, period) pair.
+   * History under an immutable commit oid never changes, so a cache hit
+   * needs no version check — only the pair itself as key.
+   */
+  private computeStats(
+    tipOid: string,
+    period: string
+  ): { periodKeys: string[]; authors: { name: string; counts: Record<string, number> }[]; totals: Record<string, number>; count: number } {
+    const cached = this.store.getStatsCache(tipOid, period);
+    if (cached) return JSON.parse(cached);
+    const { entries } = this.walkLog(tipOid, 0, MAX_STATS_SCAN);
     const keyOf = (t: number): string => {
       const d = new Date(t * 1000);
       if (period === "y") return String(d.getUTCFullYear());
@@ -1285,20 +1479,41 @@ ${items}
       return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
     };
     const periodKeys: string[] = [];
-    const byAuthor = new Map<string, Map<string, number>>();
-    const totals = new Map<string, number>();
+    const authorOrder: string[] = [];
+    const byAuthor = new Map<string, Record<string, number>>();
+    const totals: Record<string, number> = {};
     for (const e of entries) {
       const key = keyOf(e.commit.committer.time);
       if (!periodKeys.includes(key)) periodKeys.push(key);
       const author = e.commit.author.name || "(unknown)";
-      if (!byAuthor.has(author)) byAuthor.set(author, new Map());
+      if (!byAuthor.has(author)) {
+        byAuthor.set(author, {});
+        authorOrder.push(author);
+      }
       const m = byAuthor.get(author)!;
-      m.set(key, (m.get(key) ?? 0) + 1);
-      totals.set(key, (totals.get(key) ?? 0) + 1);
+      m[key] = (m[key] ?? 0) + 1;
+      totals[key] = (totals[key] ?? 0) + 1;
     }
-    const cols = periodKeys.slice(0, 8);
-    const authors = [...byAuthor.entries()]
-      .map(([name, m]) => ({ name, m, total: [...m.values()].reduce((a, b) => a + b, 0) }))
+    const result = {
+      periodKeys,
+      authors: authorOrder.map((name) => ({ name, counts: byAuthor.get(name)! })),
+      totals,
+      count: entries.length,
+    };
+    this.store.setStatsCache(tipOid, period, JSON.stringify(result));
+    return result;
+  }
+
+  private statsPage(repo: string, h: string | undefined, period: string): Response {
+    const r = `/${encodeURIComponent(repo)}`;
+    const base = this.base(repo, "stats", h, `${r}/stats/`);
+    const rr = this.resolveRef(h);
+    if (!rr) return errorPage(base, "empty repository");
+    const agg = this.computeStats(rr.oid, period);
+
+    const cols = agg.periodKeys.slice(0, 8);
+    const authors = agg.authors
+      .map((a) => ({ name: a.name, m: a.counts, total: Object.values(a.counts).reduce((x, y) => x + y, 0) }))
       .sort((a, b) => b.total - a.total)
       .slice(0, 20);
     const periodLinks = [
@@ -1317,16 +1532,16 @@ ${items}
       .map(
         (a) =>
           `<tr><td class='name'>${esc(a.name)}</td>` +
-          cols.map((k) => `<td>${a.m.get(k) ?? ""}</td>`).join("") +
+          cols.map((k) => `<td>${a.m[k] ?? ""}</td>`).join("") +
           `<td><strong>${a.total}</strong></td></tr>`
       )
       .join("");
     const totalRow =
       `<tr><td class='name'><strong>Total</strong></td>` +
-      cols.map((k) => `<td><strong>${totals.get(k) ?? 0}</strong></td>`).join("") +
-      `<td><strong>${entries.length}</strong></td></tr>`;
+      cols.map((k) => `<td><strong>${agg.totals[k] ?? 0}</strong></td>`).join("") +
+      `<td><strong>${agg.count}</strong></td></tr>`;
     const body = `
-<div>Commits per author per ${period === "w" ? "week" : period === "y" ? "year" : period === "q" ? "quarter" : "month"} (${periodLinks})${entries.length >= MAX_STATS_SCAN ? ` &mdash; last ${MAX_STATS_SCAN} commits` : ""}</div>
+<div>Commits per author per ${period === "w" ? "week" : period === "y" ? "year" : period === "q" ? "quarter" : "month"} (${periodLinks})${agg.count >= MAX_STATS_SCAN ? ` &mdash; last ${MAX_STATS_SCAN} commits` : ""}</div>
 <table class='stats'>
 <tr><th>Author</th>${cols.map((k) => `<th>${esc(k)}</th>`).join("")}<th>Total</th></tr>
 ${rows}
@@ -1334,6 +1549,25 @@ ${totalRow}
 </table>`;
     return htmlResponse(layout({ ...base, body }));
   }
+}
+
+/**
+ * Reject an oversized body from its declared length, before a byte of it is
+ * read. content-length is advisory (chunked and gzipped bodies under-report or
+ * omit it), so this is the cheap first gate only — the in-stream ingest cap and
+ * the bounded gunzip still have to hold for everything that gets past it.
+ */
+function overDeclaredLength(req: Request, maxBytes: number): boolean {
+  const declared = parseInt(req.headers.get("content-length") ?? "", 10);
+  return Number.isFinite(declared) && declared > maxBytes;
+}
+
+function tooLargeResponse(maxBytes: number): Response {
+  const mb = Math.round(maxBytes / (1024 * 1024));
+  return new Response(`error: request body exceeds the ${mb} MiB limit for this server\n`, {
+    status: 413,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
 }
 
 function renderHunk(hk: Hunk): string {
@@ -1350,10 +1584,16 @@ function rawBlobResponse(data: Uint8Array, name: string): Response {
   const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
   const types: Record<string, string> = {
     png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-    svg: "image/svg+xml", pdf: "application/pdf", html: "text/plain",
+    svg: "text/plain; charset=utf-8", pdf: "application/pdf", html: "text/plain",
   };
   const ct = types[ext] ?? (isBinary(data) ? "application/octet-stream" : "text/plain; charset=utf-8");
-  return new Response(data as unknown as BodyInit, { headers: { "content-type": ct } });
+  return new Response(data as unknown as BodyInit, {
+    headers: {
+      "content-type": ct,
+      "x-content-type-options": "nosniff",
+      "content-disposition": "inline",
+    },
+  });
 }
 
 function decodePath(p: string): string[] {

@@ -12,6 +12,9 @@ export interface Hunk {
 }
 
 const MAX_LINES = 40000;
+const MAX_PRODUCT = 4_000_000;
+const MAX_D = 2000;
+const TRACE_BUDGET = 8_000_000;
 
 /** Myers O(ND) line diff. Returns null when the input is too large. */
 export function diffLines(aText: string, bText: string): DiffOp[] | null {
@@ -20,14 +23,24 @@ export function diffLines(aText: string, bText: string): DiffOp[] | null {
   if (a[a.length - 1] === "") a.pop();
   if (b[b.length - 1] === "") b.pop();
   const N = a.length, M = b.length;
+
+  if (N === 0 || M === 0) {
+    const ops: DiffOp[] = [];
+    for (const line of a) ops.push({ tag: "del", line });
+    for (const line of b) ops.push({ tag: "add", line });
+    return ops;
+  }
   if (N + M > MAX_LINES) return null;
+  if (N * M > MAX_PRODUCT) return null;
 
   const max = N + M;
+  const dCap = Math.min(MAX_D, Math.max(1, Math.floor(TRACE_BUDGET / max)));
   const offset = max;
   const v = new Int32Array(2 * max + 2);
   const trace: Int32Array[] = [];
   let dFound = -1;
   outer: for (let d = 0; d <= max; d++) {
+    if (d > dCap) return null;
     trace.push(v.slice());
     for (let k = -d; k <= d; k += 2) {
       let x: number;

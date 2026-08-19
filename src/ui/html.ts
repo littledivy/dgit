@@ -1,9 +1,9 @@
+const ESCAPES: Record<string, string> = {
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;",
+};
+
 export function esc(s: string): string {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+  return s.replace(/[&<>"'`]/g, (c) => ESCAPES[c]);
 }
 
 /** cgit-style relative age with its color class, e.g. "3 days" / age-days. */
@@ -88,7 +88,7 @@ export function layout(o: LayoutOpts): string {
   const switcher =
     o.repo && o.branches && o.branches.length
       ? `<td class='form'><form method='get' action='${esc(o.formAction ?? `${r}/`)}'>` +
-        `<select name='h' onchange='this.form.submit();'>` +
+        `<select name='h'>` +
         o.branches
           .map((b) => `<option value='${esc(b)}'${b === o.ref ? " selected='selected'" : ""}>${esc(b)}</option>`)
           .join("") +
@@ -126,10 +126,19 @@ ${o.body}
 `;
 }
 
+const CSP =
+  "default-src 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 export function htmlResponse(html: string, status = 200): Response {
   return new Response(html, {
     status,
-    headers: { "content-type": "text/html; charset=utf-8" },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": CSP,
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "x-frame-options": "DENY",
+    },
   });
 }
 

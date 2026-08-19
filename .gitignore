@@ -2,3 +2,5 @@ node_modules/
 .wrangler/
 .dev.vars
 dist/
+scripts/*
+!scripts/gen-sha1dc-tables.mjs
