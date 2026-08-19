@@ -228,6 +228,33 @@ async function peelToCommitOid(store: GitStore, oid: string): Promise<string | n
 }
 
 /**
+ * Newest committer time (ms) across every current ref tip and HEAD: each tip is
+ * peeled through annotated tags to its commit and its committer time taken;
+ * non-commit tips are ignored, parse errors skipped. Falls back to Date.now()
+ * when the repo holds no commits. Committer time is unix seconds, so ×1000.
+ */
+export async function latestCommitTime(store: GitStore): Promise<number> {
+  const tips = new Set<string>();
+  const head = store.resolveHead();
+  if (head) tips.add(head);
+  for (const r of store.refs()) tips.add(r.target);
+  let max = 0;
+  for (const tip of tips) {
+    try {
+      const oid = await peelToCommitOid(store, tip);
+      if (!oid) continue;
+      const obj = await store.get(oid);
+      if (obj?.type !== "commit") continue;
+      const t = parseCommit(obj.data).committer.time;
+      if (t > max) max = t;
+    } catch {
+      // broken/unparseable tip: skip it, never fail the push/config
+    }
+  }
+  return max > 0 ? max * 1000 : Date.now();
+}
+
+/**
  * Depth-limited commit set from the wants (BFS, min depth wins; the tip is
  * depth 1, like git). Boundary commits are included but their parents cut.
  */

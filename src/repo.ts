@@ -14,6 +14,7 @@ import {
   renderStatus,
   sidebandFrames,
   wantsAreAllTips,
+  latestCommitTime,
   Service,
   PackCache,
 } from "./git/protocol";
@@ -246,7 +247,7 @@ export class RepoCell extends DurableObject<Env> {
     return run.then(() => result);
   }
 
-  private handleConfig(body: string): Response {
+  private async handleConfig(body: string): Promise<Response> {
     let cfg: Record<string, unknown>;
     try {
       cfg = JSON.parse(body);
@@ -257,12 +258,18 @@ export class RepoCell extends DurableObject<Env> {
     if (typeof cfg.owner === "string") this.store.setMeta("owner", cfg.owner.slice(0, 100));
     if (typeof cfg.section === "string") this.store.setMeta("section", cfg.section.slice(0, 100));
     if (typeof cfg.private === "boolean") this.store.setMeta("private", cfg.private ? "1" : "0");
-    return Response.json({
-      description: this.store.getMeta("description") ?? "",
-      owner: this.store.getMeta("owner") ?? "",
-      section: this.store.getMeta("section") ?? "",
-      private: this.store.getMeta("private") === "1",
-    });
+    // backfill the registry sort key: re-PUTing config recomputes idle from the
+    // real latest-commit date, so a mirrored repo's index age stops tracking
+    // its push time. The Worker reads this and threads it into the registry.
+    return Response.json(
+      {
+        description: this.store.getMeta("description") ?? "",
+        owner: this.store.getMeta("owner") ?? "",
+        section: this.store.getMeta("section") ?? "",
+        private: this.store.getMeta("private") === "1",
+      },
+      { headers: { "x-commit-time": String(await latestCommitTime(this.store)) } }
+    );
   }
 
   /**
@@ -442,20 +449,26 @@ export class RepoCell extends DurableObject<Env> {
       () => {},
       () => {}
     );
+    let commitTime: number | null;
     try {
-      await run;
+      commitTime = await run;
     } catch (err) {
       console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("exceeds maximum size")) return tooLargeResponse(maxBytes);
       return new Response(`error: ${msg}\n`, { status: 500 });
     }
-    return new Response(concat(chunks) as unknown as BodyInit, {
-      headers: {
-        "content-type": "application/x-git-receive-pack-result",
-        "cache-control": "no-cache",
-      },
-    });
+    const headers: Record<string, string> = {
+      "content-type": "application/x-git-receive-pack-result",
+      "cache-control": "no-cache",
+    };
+    // a real ref change: hand the Worker the newest committer date so it can set
+    // the registry sort key (x-changed gates the upsert, x-commit-time is the ms value)
+    if (commitTime !== null) {
+      headers["x-changed"] = "1";
+      headers["x-commit-time"] = String(commitTime);
+    }
+    return new Response(concat(chunks) as unknown as BodyInit, { headers });
   }
 
   private async processReceive(
@@ -463,7 +476,7 @@ export class RepoCell extends DurableObject<Env> {
     repo: string,
     maxBytes: number,
     emit: (chunk: Uint8Array) => void
-  ): Promise<void> {
+  ): Promise<number | null> {
     console.log(`[receive ${repo}] processing push request`);
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let buf: Uint8Array;
@@ -548,17 +561,14 @@ export class RepoCell extends DurableObject<Env> {
     const { results, changed, needsGc } = this.ctx.storage.transactionSync(() =>
       commitPush(this.store, plan)
     );
+    let commitTime: number | null = null;
     if (changed) {
       this.store.setMeta("created", "1");
       this.store.setMeta("last-push", String(Date.now()));
-      try {
-        // after a huge ingest, celld's output gate can refuse outbound calls
-        // until the burst is proven durable — registration must not take the
-        // whole (already applied) push down with it; the next push heals it
-        await this.env.REGISTRY.getByName("registry").upsert(repo, Date.now());
-      } catch (err) {
-        console.log(`[receive ${repo}] registry upsert deferred: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      // the registry sort key is the newest committer date, not push time; the
+      // Worker reads this off the response (x-changed / x-commit-time) and does
+      // the registry upsert, so a registry hiccup never fails the applied push
+      commitTime = await latestCommitTime(this.store);
     }
     if (needsGc) {
       this.store.setMeta("gc-pending", "1");
@@ -569,6 +579,7 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
     if (wantStatus) emit(renderStatus(results, unpackError, sideband));
+    return commitTime;
   }
 
 
@@ -1005,7 +1016,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
     const lower = readme.name.toLowerCase();
     const body =
       lower.endsWith(".md") || lower.endsWith(".markdown")
-        ? `<div class='md'>${renderMarkdown(text)}</div>`
+        ? `<div class='md'>${renderMarkdown(text, { repo, ref: h ?? base.ref })}</div>`
         : `<pre>${esc(text)}</pre>`;
     return htmlResponse(layout({ ...base, body }));
   }

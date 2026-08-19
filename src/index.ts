@@ -136,14 +136,7 @@ async function indexPage(env: Env): Promise<Response> {
   const registry = env.REGISTRY.getByName("registry");
   const repos = await registry.list();
   let rows = "";
-  let lastSection: string | null = null;
   for (const r of repos) {
-    if (r.section !== lastSection) {
-      if (r.section) {
-        rows += `<tr class='nohover'><td class='reposection' colspan='4'>${esc(r.section)}</td></tr>`;
-      }
-      lastSection = r.section;
-    }
     rows +=
       `<tr><td><a href='/${encodeURIComponent(r.name)}/'>${esc(r.name)}</a></td>` +
       `<td>${esc(r.desc || "[no description]")}</td>` +
@@ -152,7 +145,7 @@ async function indexPage(env: Env): Promise<Response> {
   }
   const body = `
 <table class='list nowrap'>
-<tr class='nohover'><th class='left'>Name</th><th class='left'>Description</th><th class='left'>Owner</th><th class='left'>Idle</th></tr>
+<tr class='nohover'><th class='left'>Name</th><th class='left'>Description</th><th class='left'>Owner</th><th class='left'>Updated</th></tr>
 ${rows || "<tr class='nohover'><td colspan='4'>no repositories yet &mdash; create one by pushing: <code>git push https://&lt;this-host&gt;/myrepo.git main</code></td></tr>"}
 </table>`;
   return htmlResponse(layout({ ...siteBase(env), body }));
@@ -376,9 +369,16 @@ export default {
     fwd.headers.set("x-proto", url.protocol.replace(":", ""));
     const res = await stub.fetch(fwd);
 
-    // bookkeeping after successful mutations
+    // bookkeeping after successful mutations. idle is the newest committer date
+    // (x-commit-time), computed by the DO which alone can read the object graph
     if (res.ok && sub === "/git-receive-pack" && res.headers.get("x-changed") === "1") {
-      await registry.upsert(repo, Date.now());
+      const idle = parseInt(res.headers.get("x-commit-time") ?? "", 10) || Date.now();
+      try {
+        // a registry hiccup must not fail an already-applied push; next push heals
+        await registry.upsert(repo, idle);
+      } catch {
+        // registry deferred
+      }
     }
     if (res.ok && (sub === "/config" || sub === "/description") && req.method === "PUT") {
       try {
@@ -388,13 +388,18 @@ export default {
           section: string;
           private: boolean;
         };
-        if (!info) await registry.upsert(repo, Date.now());
-        await registry.setConfig(repo, {
-          desc: cfg.description,
-          owner: cfg.owner,
-          section: cfg.section,
-          priv: cfg.private,
-        });
+        const idle = parseInt(res.headers.get("x-commit-time") ?? "", 10) || Date.now();
+        if (!info) await registry.upsert(repo, idle);
+        await registry.setConfig(
+          repo,
+          {
+            desc: cfg.description,
+            owner: cfg.owner,
+            section: cfg.section,
+            priv: cfg.private,
+          },
+          idle
+        );
       } catch {
         // non-JSON response; skip registry sync
       }

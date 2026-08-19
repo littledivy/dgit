@@ -299,10 +299,6 @@ div#cgit .left {
 div#cgit .right {
   text-align: right;
 }
-div#cgit table.list td.reposection {
-  font-style: italic;
-  color: #888;
-}
 div#cgit a.branch-deco {
   color: #000;
   margin: 0px 0.5em;
@@ -397,6 +393,27 @@ div#cgit div.md blockquote {
   margin-left: 0;
   padding-left: 1em;
   color: #666;
+}
+div#cgit div.md img {
+  max-width: 100%;
+}
+div#cgit div.md table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+div#cgit div.md table th, div#cgit div.md table td {
+  border: solid 1px #ccc;
+  padding: 0.3em 0.6em;
+}
+div#cgit div.md table th {
+  background: #f4f4f4;
+}
+div#cgit div.md li.task {
+  list-style: none;
+  margin-left: -1.2em;
+}
+div#cgit div.md li.task input {
+  margin-right: 0.4em;
 }
 div#cgit table.stats th {
   text-align: left;

@@ -7,7 +7,7 @@ export type RepoInfo = {
   owner: string;
   section: string;
   priv: number; // 1 = requires auth for all access, hidden from index
-  /** unix millis of last push */
+  /** unix millis of the newest commit; the index sort key */
   idle: number;
   /** bumped on every push/config change; used as the page-cache version */
   ver: number;
@@ -34,7 +34,6 @@ export class Registry extends DurableObject<Env> {
         idle INTEGER NOT NULL DEFAULT 0,
         ver INTEGER NOT NULL DEFAULT 1
       );
-      CREATE INDEX IF NOT EXISTS idx_repos_section_name ON repos (section, name);
     `);
     // upgrade path for databases created by earlier versions
     for (const col of ["section TEXT NOT NULL DEFAULT ''", "priv INTEGER NOT NULL DEFAULT 0", "ver INTEGER NOT NULL DEFAULT 1"]) {
@@ -57,15 +56,16 @@ export class Registry extends DurableObject<Env> {
     );
   }
 
-  setConfig(name: string, cfg: RepoConfig): void {
+  setConfig(name: string, cfg: RepoConfig, idle?: number): void {
     const cur = this.get(name);
     if (!cur) return;
     this.ctx.storage.sql.exec(
-      "UPDATE repos SET desc = ?, owner = ?, section = ?, priv = ?, ver = ver + 1 WHERE name = ?",
+      "UPDATE repos SET desc = ?, owner = ?, section = ?, priv = ?, idle = ?, ver = ver + 1 WHERE name = ?",
       cfg.desc ?? cur.desc,
       cfg.owner ?? cur.owner,
       cfg.section ?? cur.section,
       cfg.priv === undefined ? cur.priv : cfg.priv ? 1 : 0,
+      idle ?? cur.idle,
       name
     );
   }
@@ -85,7 +85,7 @@ export class Registry extends DurableObject<Env> {
   list(limit = 1000): RepoInfo[] {
     return this.ctx.storage.sql
       .exec<RepoInfo>(
-        "SELECT name, desc, owner, section, priv, idle, ver FROM repos WHERE priv = 0 ORDER BY section, name LIMIT ?",
+        "SELECT name, desc, owner, section, priv, idle, ver FROM repos WHERE priv = 0 ORDER BY idle DESC LIMIT ?",
         limit
       )
       .toArray();

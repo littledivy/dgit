@@ -132,10 +132,20 @@ curl -s "$BASE/demo/atom/" | grep -q "<feed xmlns"; check $? 0 "atom feed"
 blob=$(cd src && git rev-parse "HEAD:lib/math.js")
 curl -s "$BASE/demo/blob/?id=$blob" | grep -q "function add"; check $? 0 "blob by id"
 
-echo "== 11. config: description/section/owner + index sections =="
+echo "== 11. config: description/section/owner + registry idle from commit date =="
 curl -s -X PUT -u "x:$TOKEN" -d '{"description":"a lovely demo","section":"experiments","owner":"divy"}' "$BASE/demo/config" > /dev/null
-curl -s "$BASE/" | grep -q "a lovely demo"; check $? 0 "index shows description"
-curl -s "$BASE/" | grep -q "reposection.*experiments\|experiments"; check $? 0 "index shows section"
+# a repo whose only commit is dated 2010: its index "Updated" age must track that
+# commit's committer date, not the push time (idle = latest commit time)
+curl -s -o /dev/null -X DELETE -u "x:$TOKEN" "$BASE/old-date-repo"
+git init -q -b main olddate && (cd olddate && git config user.email o@o && git config user.name o \
+  && echo old > o.txt && git add -A \
+  && GIT_AUTHOR_DATE="2010-06-15T12:00:00" GIT_COMMITTER_DATE="2010-06-15T12:00:00" git commit -qm "ancient commit" \
+  && $GITC push -q "$AUTH_BASE/old-date-repo.git" main)
+idx=$(curl -s "$BASE/")
+echo "$idx" | grep -q "a lovely demo"; check $? 0 "index shows description"
+row=$(echo "$idx" | perl -pe 's{</tr>}{</tr>\n}g' | grep "old-date-repo")
+echo "  old-date-repo index row: $row"
+echo "$row" | grep -q "year"; check $? 0 "old-date-repo age reflects 2010 commit, not push time"
 
 echo "== 12. private repos =="
 git init -q -b main priv && (cd priv && git config user.email t@t && git config user.name t && echo secret > s.txt && git add -A && git commit -qm secret && $GITC push -q "$AUTH_BASE/private-repo.git" main)
