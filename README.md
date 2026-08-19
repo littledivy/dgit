@@ -23,8 +23,13 @@ pako, for zlib.
 A push streams into the repository's cell and is stored as the packfile
 the client sent; an index maps each object id to its pack, offset, and
 delta base, so the client's compression is preserved rather than
-re-derived. A clone walks the closure of the requested refs and copies
-the stored compressed bytes verbatim into the outgoing pack. Fetch
+re-derived. When an R2 bucket is bound the pack bytes are written to R2
+and only the index stays in the cell's SQLite, so pack storage is no
+longer capped by the per-cell database. A clone walks the closure of the
+requested refs and copies the stored compressed bytes verbatim into the
+outgoing pack; a full clone, once built, is cached in R2 and afterwards
+streamed straight from the Worker, so repeat clones never load the cell.
+Fetch
 negotiation excludes the closure of the client's haves, cut correctly
 at shallow boundaries, so an incremental fetch downloads only what is
 missing. Shallow clones (`--depth`, deepening, `--unshallow`), thin
@@ -44,9 +49,15 @@ the push token.
 
 ```sh
 npm install
+npx wrangler r2 bucket create dgit-pack-cache   # optional: R2 pack offload + clone cache
 npx wrangler deploy
 npx wrangler secret put GIT_TOKEN   # the push password
 ```
+
+The `PACK_CACHE` R2 binding in `wrangler.jsonc` is optional: with it,
+pushed pack bytes live in R2 (off the cell's SQLite) and full clones are
+served straight from R2 by the Worker without loading the cell. Remove
+the binding and everything falls back to the SQLite-only path.
 
 Then push anything:
 
@@ -57,10 +68,12 @@ git push -u origin main
 
 A Workers request is bounded at 128MB of memory and five minutes of
 CPU, so a very large history lands as a series of smaller pushes rather
-than one; day-to-day pushes, clones, and fetches fit comfortably. A
-full-history clone of a repository with millions of objects can exceed
-the CPU bound — shallow and incremental fetches of the same repository
-are fine.
+than one; day-to-day pushes, clones, and fetches fit comfortably.
+Building a full-history clone of a repository with millions of objects
+can exceed the CPU bound the first time — once such a clone is cached in
+R2 it streams from the Worker without rebuilding, and shallow and
+incremental fetches of the same repository are fine regardless. The
+largest repositories belong on celld.
 
 ## Self-host on celld
 
@@ -91,7 +104,10 @@ curl -X DELETE -u x:$GIT_TOKEN https://<host>/myrepo     # delete a repository
 
 Garbage collection also runs by itself, from a Durable Object alarm,
 after a forced update or a ref deletion. `GIT_TOKENS` holds additional
-comma-separated tokens; `MAX_PUSH_MB` caps a single push.
+comma-separated tokens; `MAX_PUSH_MB` caps a single push. Setting
+`SHA1DC=1` screens every pushed object for a SHA-1 collision attack on
+ingest; by default objects are hashed with native SHA-1 — the same
+object ids, without the check.
 
 ## Contributions
 

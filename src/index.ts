@@ -2,6 +2,13 @@ import type { Env } from "./env";
 import type { RepoInfo } from "./registry";
 import { esc, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
+import { parseUploadRequest, streamingCloneResponse } from "./git/protocol";
+import { isOid } from "./git/util";
+import { gunzipLimited } from "./git/zlib";
+import type { RepoCell } from "./repo";
+
+/** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
+const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
 
 export { RepoCell } from "./repo";
 export { Registry } from "./registry";
@@ -193,6 +200,54 @@ function pageCache(): Cache | null {
   }
 }
 
+/**
+ * R2 full-clone fast path, served entirely from the Worker so the DO is never
+ * contacted for bytes (this is the read-offload that avoids the workerd
+ * DO->response stall on large packs). Detects a true full clone from the tiny
+ * negotiation body — wants, no haves, `done`, not shallow/deepen, side-band-64k
+ * — then asks the DO only for the cheap versioned key (no pack generation) and
+ * streams the stored raw pack from R2 with on-the-fly side-band framing. Returns
+ * null (a miss, a partial/shallow fetch, or any failure) to fall through to the
+ * normal DO clone path. Callers MUST invoke this only after the auth gate, so a
+ * private repo never streams R2 bytes to an anonymous client.
+ */
+async function serveCloneFromR2(
+  env: Env,
+  repo: string,
+  body: Uint8Array,
+  stub: DurableObjectStub<RepoCell>
+): Promise<Response | null> {
+  const bucket = env.PACK_CACHE;
+  if (!bucket) return null;
+  const req = parseUploadRequest(body);
+  const fullClone =
+    req.wants.length > 0 &&
+    req.wants.every(isOid) &&
+    req.haves.length === 0 &&
+    req.done &&
+    req.deepen === 0 &&
+    req.clientShallows.length === 0 &&
+    req.caps.has("side-band-64k");
+  if (!fullClone) return null;
+  let key: string | null;
+  try {
+    key = await stub.currentPackKey(repo, req.wants);
+  } catch {
+    return null;
+  }
+  if (!key) return null;
+  let obj: R2ObjectBody | null;
+  try {
+    obj = await bucket.get(key);
+  } catch {
+    return null;
+  }
+  if (!obj) return null;
+  const objects = parseInt(obj.customMetadata?.objects ?? "", 10);
+  if (!Number.isFinite(objects)) return null;
+  return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"));
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -286,7 +341,30 @@ export default {
     // MB binary packs). Forward explicit bytes there; stream on workerd.
     let fwdBody: BodyInit | null = null;
     if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
-      fwdBody = pageCache() === null ? ((await req.arrayBuffer()) as ArrayBuffer) : req.body;
+      const declared = parseInt(req.headers.get("content-length") ?? "", 10);
+      const smallUploadPack =
+        sub === "/git-upload-pack" && (!Number.isFinite(declared) || declared <= MAX_UPLOAD_PACK_BYTES);
+      if (smallUploadPack) {
+        // buffer the tiny negotiation body so a full clone can be served straight
+        // from R2 (never touching the DO for bytes); the auth gate above has
+        // already run, so a private repo cannot reach this point anonymously.
+        const raw = new Uint8Array(await req.arrayBuffer());
+        let parsed: Uint8Array = raw;
+        if (req.headers.get("content-encoding")?.includes("gzip")) {
+          try {
+            parsed = gunzipLimited(raw, MAX_UPLOAD_PACK_BYTES);
+          } catch {
+            parsed = new Uint8Array(0);
+          }
+        }
+        if (env.PACK_CACHE && parsed.length) {
+          const hit = await serveCloneFromR2(env, repo, parsed, stub);
+          if (hit) return hit;
+        }
+        fwdBody = raw; // miss: forward the original (still-encoded) bytes to the DO
+      } else {
+        fwdBody = pageCache() === null ? ((await req.arrayBuffer()) as ArrayBuffer) : req.body;
+      }
     }
     const fwd = new Request(doUrl.toString(), {
       method: req.method,

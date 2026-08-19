@@ -22,6 +22,12 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RepoCell", "Registry"] }
   ],
+  // Optional: with PACK_CACHE bound, pushed pack bytes are stored in R2 (off the
+  // DO's SQLite) and full clones are served straight from R2 by the Worker.
+  // Remove this binding to fall back to the SQLite-only path (as on celld).
+  "r2_buckets": [
+    { "binding": "PACK_CACHE", "bucket_name": "dgit-pack-cache" }
+  ],
   "vars": {
     "SITE_NAME": "git.littledivy.com",
     "SITE_DESC": "a fast webinterface for the git dscm, on Cloudflare",

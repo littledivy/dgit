@@ -103,8 +103,17 @@ export class GitStore {
     return { type: rows[0].type, data: inflate(packed) };
   }
 
-  get(oid: string): { type: ObjType; data: Uint8Array } | null {
-    return this.getLoose(oid) ?? this.packs.getObject(oid, this.cache);
+  async get(oid: string): Promise<{ type: ObjType; data: Uint8Array } | null> {
+    return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache));
+  }
+
+  /**
+   * Bind (or clear) the R2 raw-pack backend for this repo. Absent binding keeps
+   * every pack in SQLite (celld / Workers without the binding). Idempotent and
+   * cheap: the DO is per-repo, so this is set on each request from the repo name.
+   */
+  setR2(bucket: R2Bucket | undefined, repo: string): void {
+    this.packs.setR2(bucket, repo);
   }
 
   put(oid: string, type: ObjType, data: Uint8Array): void {

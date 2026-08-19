@@ -3,6 +3,7 @@ import { pkt, FLUSH, PktParser } from "./pktline";
 import { GitStore } from "./store";
 import { PackWriter } from "./pack";
 import { OidSet } from "./oidset";
+import { MultipartCapture, MultipartPackUpload } from "./multipart";
 import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE } from "./objects";
 
 const AGENT = "agent=dgit/0.3";
@@ -19,6 +20,20 @@ const WALK_YIELD = 5000;
 const WALK_DATE_SLOP = 24 * 60 * 60;
 
 export type Service = "git-upload-pack" | "git-receive-pack";
+
+/**
+ * Optional R2-backed full-clone offload, write side only: on a full-clone MISS
+ * the DO tees the generated pack into a multipart upload so it never buffers the
+ * whole pack in isolate memory (no size cap). Absent on celld and on Workers
+ * without the binding, in which case every clone is served from the DO exactly
+ * as before. HITs are served by the Worker streaming R2 directly, not the DO.
+ */
+export interface PackCache {
+  repo: string;
+  /** Begin a multipart pack build under `key`, stamping the object count as
+   * customMetadata; null when R2 is unavailable (the clone still streams). */
+  beginMultipart(key: string, objects: number): Promise<MultipartPackUpload | null>;
+}
 
 /** GET /info/refs?service=... — smart ref advertisement (protocol v0). */
 export function advertisement(store: GitStore, service: Service): Uint8Array {
@@ -64,7 +79,7 @@ export function advertisement(store: GitStore, service: Service): Uint8Array {
  * who learned its sha. Membership in a set of ref tips, so a normal fetch
  * (which only ever wants advertised tips) pays a few hash lookups, not a walk.
  */
-export function advertisedOids(store: GitStore): Set<string> {
+export async function advertisedOids(store: GitStore): Promise<Set<string>> {
   const oids = new Set<string>();
   const head = store.resolveHead();
   if (head) oids.add(head);
@@ -73,7 +88,7 @@ export function advertisedOids(store: GitStore): Set<string> {
     // peel annotated tags; lightweight tags already point at the commit
     if (!r.name.startsWith("refs/tags/")) continue;
     if (store.typeAndSize(r.target)?.type !== "tag") continue;
-    const peeled = peelToCommitOid(store, r.target);
+    const peeled = await peelToCommitOid(store, r.target);
     if (peeled) oids.add(peeled);
   }
   return oids;
@@ -85,7 +100,7 @@ export function advertisedOids(store: GitStore): Set<string> {
  * cache describe precisely what the client asked for; a subset of the tips would
  * pull unrelated branches' objects in and leave the client with danglers.
  */
-function wantsAreAllTips(store: GitStore, wants: string[]): boolean {
+export function wantsAreAllTips(store: GitStore, wants: string[]): boolean {
   const tips = new Set<string>();
   for (const r of store.refs()) tips.add(r.target);
   if (tips.size === 0) return false;
@@ -107,6 +122,57 @@ export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] 
   return frames;
 }
 
+/**
+ * Serve a full clone by streaming the R2-cached raw pack straight from the
+ * Worker: the NAK preamble a full-clone negotiation always produces, the
+ * optional band-2 progress line, then the pack re-chunked into band-1 side-band
+ * frames as R2 hands it over, then flush. Framing is identical to the DO path
+ * and the pack bytes are the stored bytes, so the client receives a
+ * byte-for-byte-equal pack. Memory is one R2 read chunk at a time — never
+ * proportional to pack size — and the DO is never contacted for bytes.
+ */
+export function streamingCloneResponse(
+  body: ReadableStream<Uint8Array>,
+  objects: number,
+  noProgress: boolean
+): Response {
+  const headers = {
+    "content-type": "application/x-git-upload-pack-result",
+    "cache-control": "no-cache",
+    "x-pack-cache": "hit",
+  };
+  const reader = body.getReader();
+  let started = false;
+  let done = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull: async (ctrl) => {
+      try {
+        if (!started) {
+          started = true;
+          ctrl.enqueue(pkt("NAK\n"));
+          if (!noProgress) {
+            for (const f of sidebandFrames(2, te.encode(`Enumerating objects: ${objects}, done.\n`))) ctrl.enqueue(f);
+          }
+        }
+        const { done: rdone, value } = await reader.read();
+        if (rdone) {
+          if (!done) {
+            done = true;
+            ctrl.enqueue(FLUSH);
+            ctrl.close();
+          }
+          return;
+        }
+        for (const f of sidebandFrames(1, value)) ctrl.enqueue(f);
+      } catch (err) {
+        ctrl.error(err);
+      }
+    },
+    cancel: () => reader.cancel(),
+  });
+  return new Response(stream, { headers });
+}
+
 interface UploadRequest {
   wants: string[];
   haves: string[];
@@ -116,7 +182,7 @@ interface UploadRequest {
   caps: Set<string>;
 }
 
-function parseUploadRequest(body: Uint8Array): UploadRequest {
+export function parseUploadRequest(body: Uint8Array): UploadRequest {
   const parser = new PktParser(body);
   const req: UploadRequest = {
     wants: [],
@@ -147,9 +213,9 @@ function parseUploadRequest(body: Uint8Array): UploadRequest {
 }
 
 /** Follow tag objects down to the underlying commit oid (or null). */
-function peelToCommitOid(store: GitStore, oid: string): string | null {
+async function peelToCommitOid(store: GitStore, oid: string): Promise<string | null> {
   for (let i = 0; i < 10; i++) {
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (!obj) return null;
     if (obj.type === "commit") return oid;
     if (obj.type === "tag") {
@@ -165,16 +231,16 @@ function peelToCommitOid(store: GitStore, oid: string): string | null {
  * Depth-limited commit set from the wants (BFS, min depth wins; the tip is
  * depth 1, like git). Boundary commits are included but their parents cut.
  */
-function computeDepthSet(
+async function computeDepthSet(
   store: GitStore,
   wants: string[],
   depth: number
-): { commits: Set<string>; boundary: Set<string> } {
+): Promise<{ commits: Set<string>; boundary: Set<string> }> {
   const commits = new Set<string>();
   const boundary = new Set<string>();
   const queue: { oid: string; depth: number }[] = [];
   for (const w of wants) {
-    const c = peelToCommitOid(store, w);
+    const c = await peelToCommitOid(store, w);
     if (c && !commits.has(c)) {
       commits.add(c);
       queue.push({ oid: c, depth: 1 });
@@ -182,7 +248,7 @@ function computeDepthSet(
   }
   while (queue.length) {
     const { oid, depth: d } = queue.shift()!;
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (obj?.type !== "commit") continue;
     const parents = parseCommit(obj.data).parents;
     if (d >= depth) {
@@ -221,13 +287,13 @@ async function interestingCommits(
   const set = new OidSet(4096);
   const stack: string[] = [];
   for (const w of wants) {
-    const c = peelToCommitOid(store, w);
+    const c = await peelToCommitOid(store, w);
     if (c && !haveCommits.has(c) && set.addHex(c)) stack.push(c);
   }
   let minTime = Infinity;
   while (stack.length) {
     const oid = stack.pop()!;
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (obj?.type !== "commit") continue;
     await yieldMaybe();
     const c = parseCommit(obj.data);
@@ -272,7 +338,7 @@ async function excludedObjects(
   const haveCommits = new Set<string>();
   for (const h of haves) {
     if (!store.has(h)) continue;
-    const c = peelToCommitOid(store, h);
+    const c = await peelToCommitOid(store, h);
     if (c) haveCommits.add(c);
   }
 
@@ -289,7 +355,7 @@ async function excludedObjects(
   }
   while (commitStack.length) {
     const oid = commitStack.pop()!;
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (!obj) continue;
     await yieldMaybe();
     if (obj.type === "tag") {
@@ -314,7 +380,7 @@ async function excludedObjects(
   for (let i = 0; i < interesting.size; i++) {
     const oid = interesting.atHex(i);
     if (excluded.hasHex(oid)) continue; // contested: reachable from a have too
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (obj?.type !== "commit") continue;
     await yieldMaybe();
     for (const p of parseCommit(obj.data).parents) {
@@ -324,14 +390,14 @@ async function excludedObjects(
 
   const trees: string[] = [];
   for (const oid of boundary) {
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (obj?.type !== "commit") continue;
     const tree = parseCommit(obj.data).tree;
     if (tree && excluded.addHex(tree)) trees.push(tree);
   }
   while (trees.length) {
     const oid = trees.pop()!;
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (obj?.type !== "tree") continue;
     await yieldMaybe();
     for (const e of parseTree(obj.data)) {
@@ -377,14 +443,14 @@ async function collectPackOids(
     if (meta.type === "commit" && commitLimit && !commitLimit.has(oid)) continue;
     if (excluded.hasHex(oid)) {
       if (descendThroughExcluded && meta.type === "commit") {
-        const full = store.get(oid)!;
+        const full = (await store.get(oid))!;
         stack.push(...parseCommit(full.data).parents);
       }
       continue;
     }
     walk.markHex(oid);
     if (meta.type === "blob") continue; // leaf: membership only
-    const full = store.get(oid)!;
+    const full = (await store.get(oid))!;
     if (full.type === "commit") {
       const c = parseCommit(full.data);
       stack.push(c.tree, ...c.parents);
@@ -409,7 +475,8 @@ async function collectPackOids(
 export async function uploadPack(
   store: GitStore,
   body: Uint8Array,
-  release: () => void = () => {}
+  release: () => void = () => {},
+  packCache?: PackCache
 ): Promise<Response> {
   const headers = {
     "content-type": "application/x-git-upload-pack-result",
@@ -421,7 +488,7 @@ export async function uploadPack(
     return new Response(pkt("ERR no valid wants\n") as unknown as BodyInit, { headers });
   }
   // a want must be an object we currently advertise, not merely one we store
-  const allowed = advertisedOids(store);
+  const allowed = await advertisedOids(store);
   for (const w of req.wants) {
     if (!allowed.has(w) || !store.has(w)) {
       release();
@@ -441,7 +508,7 @@ export async function uploadPack(
         if (store.has(s)) preamble.push(pkt(`unshallow ${s}\n`));
       }
     } else {
-      const { commits, boundary } = computeDepthSet(store, req.wants, req.deepen);
+      const { commits, boundary } = await computeDepthSet(store, req.wants, req.deepen);
       commitLimit = commits;
       for (const b of boundary) {
         if (!clientShallowSet.has(b)) preamble.push(pkt(`shallow ${b}\n`));
@@ -496,6 +563,9 @@ export async function uploadPack(
     return new Response(concat(preamble) as unknown as BodyInit, { headers });
   }
 
+  const sideband = req.caps.has("side-band-64k");
+  const noProgress = req.caps.has("no-progress");
+
   // Full-clone fast path: no haves, not shallow/deepen, and the wants are
   // exactly the current ref tips. The reachable object set is then identical to
   // what the graph walk would rediscover, so serve it from the versioned cache
@@ -504,6 +574,18 @@ export async function uploadPack(
   // through to the walk, which then repopulates it — so a wrong pack is never
   // served, and existing repos become fast on their next full clone.
   const fullClone = !req.haves.length && req.deepen === 0 && wantsAreAllTips(store, req.wants);
+
+  // R2 full-clone offload (write side). Only a standard side-band-64k full clone
+  // is eligible, and it is reached only after the advertised-oids gate above — so
+  // the versioned key can never warm an unreachable/force-pushed object. The key
+  // is the ref version, so a push/force-push/delete lands on a fresh key and
+  // stale packs are simply never referenced. HITs are served by the Worker
+  // streaming R2 directly; the DO only reaches here on a MISS, where it serves
+  // the client and self-warms the cache via multipart while it streams (see
+  // `capture` below). Absent R2 (celld / no binding) this is a plain DO clone.
+  const r2Key =
+    fullClone && sideband && packCache ? `pack/${packCache.repo}/${store.reachableVersion()}` : null;
+
   let send = fullClone ? store.loadReachable() : null;
   if (!send) {
     const excluded = await excludedObjects(store, req.haves, req.clientShallows, req.wants);
@@ -621,9 +703,6 @@ export async function uploadPack(
     });
   }
 
-  const sideband = req.caps.has("side-band-64k");
-  const noProgress = req.caps.has("no-progress");
-
   // stream the pack: preamble, then pack bytes (side-band framed if negotiated)
   const pending: Uint8Array[] = [concat(preamble)];
   let buffered: Uint8Array[] = [];
@@ -636,7 +715,18 @@ export async function uploadPack(
     if (sideband) pending.push(...sidebandFrames(1, payload));
     else pending.push(payload);
   };
+  // Self-warm R2 on a full-clone MISS: tee the raw pack (writer output, verbatim
+  // — same bytes a later HIT re-frames) into a multipart upload alongside the
+  // live stream. The pack streams into R2 in 16 MiB parts as it is generated, so
+  // isolate memory is never proportional to pack size and there is no size cap.
+  // A failed begin just streams the clone without caching.
+  let capture: MultipartCapture | null = null;
+  if (r2Key && packCache) {
+    const mp = await packCache.beginMultipart(r2Key, total);
+    if (mp) capture = new MultipartCapture(mp);
+  }
   const writer = new PackWriter((chunk) => {
+    if (capture) capture.push(chunk);
     buffered.push(chunk);
     bufferedLen += chunk.length;
     if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
@@ -653,7 +743,7 @@ export async function uploadPack(
       for (const c of pending) ctrl.enqueue(c);
       pending.length = 0;
     },
-    pull: (ctrl) => {
+    pull: async (ctrl) => {
       try {
         for (let n = 0; n < 64 && i < total; n++, i++) {
           const idx = order ? order[i] : i;
@@ -663,11 +753,11 @@ export async function uploadPack(
             const oid = send.markedAtHex(idx);
             const entry = store.packs.lookup(oid);
             if (entry && !entry.baseOid) {
-              writer.rawFull(entry.type, entry.entrySize, store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+              writer.rawFull(entry.type, entry.entrySize, await store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
             } else if (entry && entry.baseOid && send.isMarkedHex(entry.baseOid)) {
-              writer.rawDelta(entry.entrySize, entry.baseOid, store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
+              writer.rawDelta(entry.entrySize, entry.baseOid, await store.packs.readRaw(entry.packId, entry.dataOff, entry.dataLen));
             } else {
-              const obj = store.get(oid);
+              const obj = await store.get(oid);
               if (!obj) throw new Error(`missing object ${oid}`);
               writer.object(obj.type, obj.data);
             }
@@ -677,12 +767,12 @@ export async function uploadPack(
           // the lean typed arrays, so no SQL lookup happens here.
           const code = eCode[idx];
           if (code <= -3) {
-            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
+            writer.rawFull(NUM_TYPE[-2 - code], eSize![idx], await store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
           } else if (code >= 0) {
-            writer.rawDelta(eSize![idx], send.atHex(code), store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
+            writer.rawDelta(eSize![idx], send.atHex(code), await store.packs.readRaw(ePack![idx], eDataOff![idx], eDataLen![idx]));
           } else {
             const oid = send.markedAtHex(idx);
-            const obj = store.get(oid);
+            const obj = await store.get(oid);
             if (!obj) throw new Error(`missing object ${oid}`);
             writer.object(obj.type, obj.data);
           }
@@ -697,17 +787,28 @@ export async function uploadPack(
         }
         for (const c of pending) ctrl.enqueue(c);
         pending.length = 0;
+        // Warm R2 in lock-step with generation: the client already has this
+        // batch's bytes, and awaiting the part upload here is what bounds isolate
+        // memory to one part regardless of pack size. finish() flushes the final
+        // part and completes; a failure aborts, leaving no partial R2 object.
+        if (capture) {
+          if (finished) await capture.finish();
+          else await capture.drain();
+        }
         if (finished) {
           ctrl.close();
           release(); // stream fully drained: this upload no longer holds a slot
         }
       } catch (err) {
+        if (capture) await capture.abort();
         release();
         ctrl.error(err);
       }
     },
-    cancel: () => {
-      // client went away mid-transfer (e.g. negotiation round abort)
+    cancel: async () => {
+      // client went away mid-transfer (e.g. negotiation round abort): abort the
+      // half-built multipart upload so R2 keeps no partial object
+      if (capture) await capture.abort();
       release();
     },
   });
@@ -715,13 +816,13 @@ export async function uploadPack(
 }
 
 /** Is `anc` an ancestor of (or equal to) `desc`? Bounded walk. */
-export function isAncestor(store: GitStore, anc: string, desc: string): boolean {
+export async function isAncestor(store: GitStore, anc: string, desc: string): Promise<boolean> {
   if (anc === desc) return true;
   const seen = new Set<string>([desc]);
   const stack = [desc];
   let visited = 0;
   while (stack.length && visited++ < 10000) {
-    const obj = store.get(stack.pop()!);
+    const obj = await store.get(stack.pop()!);
     if (obj?.type !== "commit") continue;
     for (const p of parseCommit(obj.data).parents) {
       if (p === anc) return true;
@@ -778,7 +879,7 @@ const BAD_REF = /[\s~^:?*\[\\'"<>&`\x00-\x1f\x7f]/;
  * closure was validated at their own push, so descent stops there — the walk
  * touches only objects this push introduced.
  */
-function reachableComplete(store: GitStore, tip: string, known: OidSet): boolean {
+async function reachableComplete(store: GitStore, tip: string, known: OidSet): Promise<boolean> {
   const stack = [tip];
   while (stack.length) {
     const oid = stack.pop()!;
@@ -786,7 +887,7 @@ function reachableComplete(store: GitStore, tip: string, known: OidSet): boolean
     const meta = store.typeAndSize(oid);
     if (!meta) return false;
     if (meta.type === "blob") continue;
-    const obj = store.get(oid);
+    const obj = await store.get(oid);
     if (!obj) return false;
     if (obj.type === "commit") {
       const c = parseCommit(obj.data);
@@ -803,15 +904,38 @@ function reachableComplete(store: GitStore, tip: string, known: OidSet): boolean
   return true;
 }
 
-/** Apply ref updates after the pack (if any) has been ingested. */
-export function applyPushCommands(
+/** Per-command outcome decided by the object-reading validation pass. */
+interface PushDecision {
+  ref: string;
+  expectedOld: string; // CAS value re-checked atomically at commit
+  reject?: string; // ng message; the command does not apply
+  del?: boolean; // delete the ref
+  set?: string; // move the ref to this oid
+  forced?: boolean; // a set that strands old history (non-fast-forward)
+}
+
+/** Result of the async push validation, consumed by the sync commit under a savepoint. */
+export interface PushPlan {
+  decisions: PushDecision[];
+  known: OidSet;
+  hadCache: boolean;
+}
+
+/**
+ * Validate push commands against the (already ingested) object database. This
+ * is the object-reading half — connectivity + ancestry walks — and is async
+ * because an R2-backed pack's bytes are fetched over the network. It performs no
+ * writes; the ref mutations happen in commitPush under a savepoint. Splitting
+ * the read pass out is what lets the writes stay inside transactionSync (which
+ * cannot await) while still reading R2-backed objects. Pushes are serialized
+ * (receiveChain) and only pushes write refs, so ref state read here is stable
+ * through to commit; commitPush re-checks each CAS atomically regardless.
+ */
+export async function validatePush(
   store: GitStore,
   commands: PushCommand[],
   unpackError: string | null
-): { results: CommandResult[]; changed: boolean; needsGc: boolean } {
-  const results: CommandResult[] = [];
-  let changed = false;
-  let needsGc = false;
+): Promise<PushPlan> {
   // whether the reachable cache is valid for the pre-push refs: only then can
   // it be extended in place (union with the connectivity walk) instead of
   // rebuilt from scratch on the next full clone
@@ -821,14 +945,16 @@ export function applyPushCommands(
   const known = new OidSet(4096);
   for (const r of store.refs()) {
     known.addHex(r.target);
-    const c = peelToCommitOid(store, r.target);
+    const c = await peelToCommitOid(store, r.target);
     if (c) known.addHex(c);
   }
   const knownHead = store.resolveHead();
   if (knownHead) known.addHex(knownHead);
+
+  const decisions: PushDecision[] = [];
   for (const cmd of commands) {
     if (unpackError) {
-      results.push({ ref: cmd.ref, ok: false, msg: "unpacker error" });
+      decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "unpacker error" });
       continue;
     }
     const bad = !cmd.ref.startsWith("refs/") || cmd.ref.includes("..") || BAD_REF.test(cmd.ref)
@@ -836,29 +962,61 @@ export function applyPushCommands(
       || cmd.ref.endsWith("/") || cmd.ref.length > 255
       || cmd.ref.split("/").some((c) => c.startsWith("."));
     if (bad) {
-      results.push({ ref: cmd.ref, ok: false, msg: "funny refname" });
+      decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "funny refname" });
       continue;
     }
     const current = store.getRef(cmd.ref) ?? ZERO_OID;
     if (current !== cmd.old) {
-      results.push({ ref: cmd.ref, ok: false, msg: "fetch first" });
+      decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "fetch first" });
       continue;
     }
     if (cmd.next === ZERO_OID) {
-      store.delRef(cmd.ref);
+      decisions.push({ ref: cmd.ref, expectedOld: cmd.old, del: true });
+      continue;
+    }
+    if (!(await reachableComplete(store, cmd.next, known))) {
+      decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "missing necessary objects" });
+      continue;
+    }
+    const forced = cmd.old !== ZERO_OID && !(await isAncestor(store, cmd.old, cmd.next));
+    decisions.push({ ref: cmd.ref, expectedOld: cmd.old, set: cmd.next, forced });
+  }
+  return { decisions, known, hadCache };
+}
+
+/**
+ * Apply a validated PushPlan under a savepoint (transactionSync): a multi-ref
+ * push must not leave half its branches moved if a later update throws. Each CAS
+ * is re-checked here against live ref state so the write is atomic with its
+ * guard; a mismatch (a ref moved between validation and commit, which the push
+ * serialization normally prevents) both rejects that command and forces the
+ * reachable cache to be rebuilt rather than extended from a now-stale walk.
+ */
+export function commitPush(store: GitStore, plan: PushPlan): { results: CommandResult[]; changed: boolean; needsGc: boolean } {
+  const results: CommandResult[] = [];
+  let changed = false;
+  let needsGc = false;
+  let casMismatch = false;
+  for (const d of plan.decisions) {
+    if (d.reject) {
+      results.push({ ref: d.ref, ok: false, msg: d.reject });
+      continue;
+    }
+    const current = store.getRef(d.ref) ?? ZERO_OID;
+    if (current !== d.expectedOld) {
+      results.push({ ref: d.ref, ok: false, msg: "fetch first" });
+      casMismatch = true;
+      continue;
+    }
+    if (d.del) {
+      store.delRef(d.ref);
       needsGc = true;
     } else {
-      if (!reachableComplete(store, cmd.next, known)) {
-        results.push({ ref: cmd.ref, ok: false, msg: "missing necessary objects" });
-        continue;
-      }
-      if (cmd.old !== ZERO_OID && !isAncestor(store, cmd.old, cmd.next)) {
-        needsGc = true; // forced update strands old history
-      }
-      store.setRef(cmd.ref, cmd.next);
+      store.setRef(d.ref, d.set!);
+      if (d.forced) needsGc = true; // forced update strands old history
     }
     changed = true;
-    results.push({ ref: cmd.ref, ok: true });
+    results.push({ ref: d.ref, ok: true });
   }
 
   // keep HEAD pointing at a branch that exists (first push wins, prefer main/master)
@@ -875,10 +1033,11 @@ export function applyPushCommands(
   // walk: the pre-existing tips plus every object this push newly connected. On
   // a pure fast-forward with a valid prior cache, union closes over exactly the
   // new reachable set. Anything else (a force-push/delete that strands history,
-  // or no prior cache to extend) invalidates it, so the next full clone rebuilds
-  // by walking rather than risk serving objects that are no longer reachable.
+  // no prior cache to extend, or a commit-time CAS mismatch that leaves `known`
+  // describing a command that did not apply) invalidates it, so the next full
+  // clone rebuilds by walking rather than risk serving unreachable objects.
   if (changed) {
-    if (hadCache && !needsGc) store.extendReachable(known);
+    if (plan.hadCache && !needsGc && !casMismatch) store.extendReachable(plan.known);
     else store.invalidateReachable();
   }
   return { results, changed, needsGc };

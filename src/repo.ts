@@ -9,10 +9,13 @@ import {
   advertisement,
   uploadPack,
   parsePushCommands,
-  applyPushCommands,
+  validatePush,
+  commitPush,
   renderStatus,
   sidebandFrames,
+  wantsAreAllTips,
   Service,
+  PackCache,
 } from "./git/protocol";
 import {
   Commit,
@@ -95,12 +98,23 @@ export class RepoCell extends DurableObject<Env> {
     this.store = new GitStore(ctx.storage.sql);
   }
 
+  /**
+   * Bind the R2 raw-pack backend for this repo (absent binding keeps every pack
+   * in SQLite). The DO is per-repo, so the name is stable; persist it once so
+   * alarm-driven GC — which has no request to read x-repo from — can rebind.
+   */
+  private bindR2(repo: string): void {
+    this.store.setR2(this.env.PACK_CACHE, repo);
+    if (this.env.PACK_CACHE && this.store.getMeta("repo") !== repo) this.store.setMeta("repo", repo);
+  }
+
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const repo = req.headers.get("x-repo") ?? "repo";
     const host = req.headers.get("x-host") ?? url.host;
     const proto = req.headers.get("x-proto") ?? "https";
     const path = url.pathname;
+    this.bindR2(repo);
 
     try {
       if (path === "/info/refs" && req.method === "GET") {
@@ -136,7 +150,7 @@ export class RepoCell extends DurableObject<Env> {
           this.activeUploads--;
         };
         try {
-          return await uploadPack(this.store, await this.readBody(req), release);
+          return await uploadPack(this.store, await this.readBody(req), release, this.packCacheFor(repo));
         } catch (err) {
           release();
           // an over-inflating body is the client's fault, not a server error
@@ -168,7 +182,12 @@ export class RepoCell extends DurableObject<Env> {
           // this instance stays resident: bring the (empty) schema back so
           // later requests — including a re-creating push — find their tables
           this.store = new GitStore(this.ctx.storage.sql);
+          this.bindR2(repo);
         });
+        // the R2 packs (clone cache + raw pack store) outlive the SQLite wipe;
+        // purge them so a re-created repo never inherits stale bytes (its
+        // versioned keys would differ anyway)
+        await this.purgePackCache(repo);
         return new Response("deleted\n");
       }
       if (path === "/gc" && req.method === "POST") {
@@ -176,7 +195,7 @@ export class RepoCell extends DurableObject<Env> {
       }
 
       if (req.method !== "GET") return new Response("method not allowed\n", { status: 405 });
-      return this.ui(repo, host, proto, path, url.searchParams);
+      return await this.ui(repo, host, proto, path, url.searchParams);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return new Response(`error: ${msg}\n`, { status: 500 });
@@ -198,6 +217,9 @@ export class RepoCell extends DurableObject<Env> {
     }
     // clear first: at-most-once, so a throwing sweep can't trigger a retry storm
     this.store.setMeta("gc-pending", "0");
+    // no request here to carry x-repo: rebind R2 from the persisted repo name so
+    // the sweep can read R2-backed objects and drop their raw objects
+    this.bindR2(this.store.getMeta("repo") ?? "repo");
     try {
       await this.gc();
     } catch (err) {
@@ -214,7 +236,7 @@ export class RepoCell extends DurableObject<Env> {
     let result: { removed: number; kept: number; skipped?: boolean } = { removed: 0, kept: 0 };
     const run = this.receiveChain.then(() =>
       this.ctx.blockConcurrencyWhile(async () => {
-        result = this.runGc();
+        result = await this.runGc();
       })
     );
     this.receiveChain = run.then(
@@ -248,7 +270,7 @@ export class RepoCell extends DurableObject<Env> {
    * packs are kept (deleting mid-pack is impossible without a repack);
    * huge repos skip the sweep entirely — the walk isn't worth it.
    */
-  private runGc(): { removed: number; kept: number; skipped?: boolean } {
+  private async runGc(): Promise<{ removed: number; kept: number; skipped?: boolean }> {
     if (this.store.objectCount() > 300_000) {
       return { removed: 0, kept: this.store.objectCount(), skipped: true };
     }
@@ -262,7 +284,7 @@ export class RepoCell extends DurableObject<Env> {
       const meta = this.store.typeAndSize(oid);
       if (!meta) continue;
       if (meta.type === "blob") continue; // leaf: never inflate blob content here
-      const obj = this.store.get(oid);
+      const obj = await this.store.get(oid);
       if (!obj) continue;
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);
@@ -296,7 +318,7 @@ export class RepoCell extends DurableObject<Env> {
       for (let i = 0; i < reachable.size; i++) {
         const oid = reachable.atHex(i);
         if (this.store.packs.lookup(oid)) {
-          const obj = this.store.get(oid);
+          const obj = await this.store.get(oid);
           if (obj) {
             this.store.put(oid, obj.type, obj.data);
             migrated++;
@@ -304,7 +326,11 @@ export class RepoCell extends DurableObject<Env> {
         }
       }
       removed += packCount - migrated;
+      // capture the R2-backed pack ids before the index is dropped, then delete
+      // their raw objects after reset so no orphaned bytes linger in R2
+      const r2ids = this.store.packs.r2PackIds();
       this.store.packs.reset();
+      await this.store.packs.deleteR2Packs(r2ids);
     }
     // sweep loose objects (including anything just migrated) unreachable now
     for (const oid of this.store.allOids()) {
@@ -314,6 +340,74 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
     return noHeadroom ? { removed, kept: reachable.size, skipped: true } : { removed, kept: reachable.size };
+  }
+
+  /**
+   * Cheap full-clone key probe for the Worker's R2 fast path: returns the
+   * versioned pack key iff `wants` is exactly the current ref tips (a true full
+   * clone). Reads ref state only — it never generates a pack. null (wants are
+   * not all tips) sends the Worker back to the normal DO clone path. The key is
+   * the ref version, so it can never name a stale/force-pushed pack.
+   */
+  currentPackKey(repo: string, wants: string[]): string | null {
+    if (!wantsAreAllTips(this.store, wants)) return null;
+    return `pack/${repo}/${this.store.reachableVersion()}`;
+  }
+
+  /**
+   * R2 full-clone offload adapter (write side), or undefined when no bucket is
+   * bound (celld and Workers without the binding both fall back to the pure DO
+   * path). A throwing createMultipartUpload (celld deliberately makes R2 throw)
+   * degrades to null so the clone still streams uncached; part-level failures
+   * are handled by MultipartCapture aborting the upload.
+   */
+  private packCacheFor(repo: string): PackCache | undefined {
+    const bucket = this.env.PACK_CACHE;
+    if (!bucket) return undefined;
+    return {
+      repo,
+      beginMultipart: async (key, objects) => {
+        try {
+          const mp = await bucket.createMultipartUpload(key, {
+            customMetadata: { objects: String(objects) },
+          });
+          const parts: R2UploadedPart[] = [];
+          return {
+            uploadPart: async (data) => {
+              parts.push(await mp.uploadPart(parts.length + 1, data));
+            },
+            complete: async () => {
+              await mp.complete(parts);
+            },
+            abort: async () => {
+              await mp.abort();
+            },
+          };
+        } catch (err) {
+          console.log(`[r2 ${repo}] multipart begin failed: ${err instanceof Error ? err.message : String(err)}`);
+          return null;
+        }
+      },
+    };
+  }
+
+  /** Purge every R2 object for a repo on delete: clone-cache packs (all versions)
+   * and raw pack-store objects. */
+  private async purgePackCache(repo: string): Promise<void> {
+    const bucket = this.env.PACK_CACHE;
+    if (!bucket) return;
+    for (const prefix of [`pack/${repo}/`, `raw/${repo}/`]) {
+      try {
+        for (let cursor: string | undefined; ; ) {
+          const listed = await bucket.list({ prefix, cursor });
+          if (listed.objects.length) await bucket.delete(listed.objects.map((o) => o.key));
+          if (!listed.truncated) break;
+          cursor = listed.cursor;
+        }
+      } catch (err) {
+        console.log(`[r2 ${repo}] purge ${prefix} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   private async readBody(req: Request): Promise<Uint8Array> {
@@ -433,6 +527,7 @@ export class RepoCell extends DurableObject<Env> {
           cache: new ObjCache(budget),
           onProgress: progress,
           flush: () => this.ctx.storage.sync(),
+          collisionDetect: this.env.SHA1DC === "1",
         });
       } catch (err) {
         unpackError = err instanceof Error ? err.message : String(err);
@@ -445,10 +540,13 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
 
-    // one savepoint around every ref update: a multi-ref push (git push --all)
-    // must not leave half its branches moved if a later update throws
+    // validate connectivity/ancestry first (async: an R2-backed pack's objects
+    // are fetched over the network, which transactionSync cannot await), then
+    // apply the ref writes under one savepoint — a multi-ref push (git push
+    // --all) must not leave half its branches moved if a later update throws
+    const plan = await validatePush(this.store, commands, unpackError);
     const { results, changed, needsGc } = this.ctx.storage.transactionSync(() =>
-      applyPushCommands(this.store, commands, unpackError)
+      commitPush(this.store, plan)
     );
     if (changed) {
       this.store.setMeta("created", "1");
@@ -474,7 +572,7 @@ export class RepoCell extends DurableObject<Env> {
   }
 
 
-  private base(repo: string, tab: string, ref?: string, formAction?: string): Omit<LayoutOpts, "body"> {
+  private async base(repo: string, tab: string, ref?: string, formAction?: string): Promise<Omit<LayoutOpts, "body">> {
     const branches = this.store
       .refs()
       .filter((r) => r.name.startsWith("refs/heads/"))
@@ -489,13 +587,13 @@ export class RepoCell extends DurableObject<Env> {
       sub: this.store.getMeta("description") || "[no description]",
       tab,
       ref: ref ?? headBranch,
-      hasAbout: this.findReadme() !== null,
+      hasAbout: (await this.findReadme()) !== null,
       branches,
       formAction: formAction ?? `/${encodeURIComponent(repo)}/`,
     };
   }
 
-  private ui(repo: string, host: string, proto: string, path: string, q: URLSearchParams): Response {
+  private async ui(repo: string, host: string, proto: string, path: string, q: URLSearchParams): Promise<Response> {
     const h = q.get("h") ?? undefined;
     if (path === "/" || path === "") return this.summaryPage(repo, host, proto);
     if (path === "/about/" || path === "/about") return this.aboutPage(repo, h);
@@ -520,7 +618,7 @@ export class RepoCell extends DurableObject<Env> {
     if (path.startsWith("/plain")) return this.plainPage(h, decodePath(path.slice("/plain".length)));
     if (path.startsWith("/blame")) return this.blamePage(repo, h, decodePath(path.slice("/blame".length)));
     if (path.startsWith("/snapshot/")) return this.snapshotPage(repo, decodeURIComponent(path.slice("/snapshot/".length)));
-    return errorPage(this.base(repo, "summary"), `page not found: ${path}`);
+    return errorPage(await this.base(repo, "summary"), `page not found: ${path}`);
   }
 
 
@@ -531,13 +629,13 @@ export class RepoCell extends DurableObject<Env> {
    * brute-forced through the UI even after the protocol side stopped serving
    * unreachable objects.
    */
-  private resolveServable(id: string): string | null {
+  private async resolveServable(id: string): Promise<string | null> {
     if (!isOid(id) || !this.store.has(id)) return null;
-    return this.reachableOid(id) ? id : null;
+    return (await this.reachableOid(id)) ? id : null;
   }
 
   /** Is `target` reachable from any current ref (or HEAD)? */
-  private reachableOid(target: string): boolean {
+  private async reachableOid(target: string): Promise<boolean> {
     // the full-clone reachable-set cache is versioned against current refs
     // (null on any mismatch), so a hit here is exactly as correct as the walk
     // below and skips inflating/parsing the whole object graph
@@ -554,7 +652,7 @@ export class RepoCell extends DurableObject<Env> {
       const meta = this.store.typeAndSize(oid);
       if (!meta) continue;
       if (meta.type === "blob") continue;
-      const obj = this.store.get(oid);
+      const obj = await this.store.get(oid);
       if (!obj) continue;
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);
@@ -572,7 +670,7 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Resolve ?h= (branch, tag, full ref, or oid) to an object id. */
-  private resolveRef(h?: string): { refName: string | null; oid: string } | null {
+  private async resolveRef(h?: string): Promise<{ refName: string | null; oid: string } | null> {
     if (!h) {
       const oid = this.store.resolveHead();
       return oid ? { refName: this.store.head(), oid } : null;
@@ -581,7 +679,7 @@ export class RepoCell extends DurableObject<Env> {
       const oid = this.store.getRef(cand);
       if (oid) return { refName: cand, oid };
     }
-    const full = this.resolveServable(h);
+    const full = await this.resolveServable(h);
     if (full) return { refName: null, oid: full };
     return null;
   }
@@ -591,15 +689,15 @@ export class RepoCell extends DurableObject<Env> {
    * content, so a start oid that actually peeled through a tag has its final
    * commit oid cached — a hit skips every intermediate tag object read.
    */
-  private peelToCommit(oid: string): { oid: string; commit: Commit } | null {
+  private async peelToCommit(oid: string): Promise<{ oid: string; commit: Commit } | null> {
     const start = oid;
     const cached = this.store.getPeeled(start);
     if (cached !== null) {
-      const obj = this.store.get(cached);
+      const obj = await this.store.get(cached);
       return obj?.type === "commit" ? { oid: cached, commit: parseCommit(obj.data) } : null;
     }
     for (let i = 0; i < 10; i++) {
-      const obj = this.store.get(oid);
+      const obj = await this.store.get(oid);
       if (!obj) return null;
       if (obj.type === "commit") {
         if (oid !== start) this.store.setPeeled(start, oid);
@@ -614,16 +712,16 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private loadCommit(oid: string): Commit | null {
-    const obj = this.store.get(oid);
+  private async loadCommit(oid: string): Promise<Commit | null> {
+    const obj = await this.store.get(oid);
     return obj?.type === "commit" ? parseCommit(obj.data) : null;
   }
 
   /** oid of the entry at `path` in this commit's tree (any type), or null. */
-  private pathOid(commit: Commit, path: string[]): string | null {
+  private async pathOid(commit: Commit, path: string[]): Promise<string | null> {
     let oid = commit.tree;
     for (const seg of path) {
-      const obj = this.store.get(oid);
+      const obj = await this.store.get(oid);
       if (obj?.type !== "tree") return null;
       const entry = parseTree(obj.data).find((e) => e.name === seg);
       if (!entry) return null;
@@ -633,12 +731,12 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** pathOid keyed by the root tree it starts from: shared across a log walk. */
-  private pathOidCached(treeOid: string, path: string[], memo: Map<string, string | null>): string | null {
+  private async pathOidCached(treeOid: string, path: string[], memo: Map<string, string | null>): Promise<string | null> {
     const hit = memo.get(treeOid);
     if (hit !== undefined) return hit;
     let oid: string | null = treeOid;
     for (const seg of path) {
-      const obj = this.store.get(oid);
+      const obj = await this.store.get(oid);
       if (obj?.type !== "tree") { oid = null; break; }
       const entry = parseTree(obj.data).find((e) => e.name === seg);
       if (!entry) { oid = null; break; }
@@ -648,11 +746,11 @@ export class RepoCell extends DurableObject<Env> {
     return oid;
   }
 
-  private matchesFilter(e: LogEntry, filter: LogFilter, memo: Map<string, string | null>): boolean {
+  private async matchesFilter(e: LogEntry, filter: LogFilter, memo: Map<string, string | null>): Promise<boolean> {
     if (filter.path && filter.path.length) {
-      const mine = this.pathOidCached(e.commit.tree, filter.path, memo);
-      const parentTree = e.commit.parents[0] ? this.loadCommit(e.commit.parents[0])?.tree : undefined;
-      const theirs = parentTree ? this.pathOidCached(parentTree, filter.path, memo) : null;
+      const mine = await this.pathOidCached(e.commit.tree, filter.path, memo);
+      const parentTree = e.commit.parents[0] ? (await this.loadCommit(e.commit.parents[0]))?.tree : undefined;
+      const theirs = parentTree ? await this.pathOidCached(parentTree, filter.path, memo) : null;
       if (mine === theirs) return false;
     }
     if (filter.q) {
@@ -670,8 +768,8 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Date-ordered commit walk (newest first) with optional filtering. */
-  private walkLog(tip: string, skip: number, limit: number, filter: LogFilter = {}): { entries: LogEntry[]; more: boolean } {
-    const first = this.peelToCommit(tip);
+  private async walkLog(tip: string, skip: number, limit: number, filter: LogFilter = {}): Promise<{ entries: LogEntry[]; more: boolean }> {
+    const first = await this.peelToCommit(tip);
     if (!first) return { entries: [], more: false };
     skip = Math.min(skip, MAX_LOG_SCAN); // a wild ofs must not drive the walk to its cap for an empty page
     const scanCap = filter.path?.length ? PATH_LOG_SCAN : MAX_LOG_SCAN;
@@ -683,11 +781,11 @@ export class RepoCell extends DurableObject<Env> {
     while (frontier.length && out.length < skip + limit + 1 && scanned++ < scanCap) {
       frontier.sort((a, b) => b.commit.committer.time - a.commit.committer.time);
       const cur = frontier.shift()!;
-      if (this.matchesFilter(cur, filter, memo)) out.push(cur);
+      if (await this.matchesFilter(cur, filter, memo)) out.push(cur);
       for (const p of cur.commit.parents) {
         if (seen.has(p)) continue;
         seen.add(p);
-        const c = this.loadCommit(p);
+        const c = await this.loadCommit(p);
         if (c) frontier.push({ oid: p, commit: c });
       }
     }
@@ -695,17 +793,17 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** First-parent history of a path (for blame), newest first, with blobs. */
-  private pathHistory(tip: string, path: string[], cap: number, maxBytes: number): BlameHistoryEntry[] {
+  private async pathHistory(tip: string, path: string[], cap: number, maxBytes: number): Promise<BlameHistoryEntry[]> {
     const out: BlameHistoryEntry[] = [];
-    let cur = this.peelToCommit(tip);
+    let cur = await this.peelToCommit(tip);
     let steps = 0;
     let bytes = 0;
     while (cur && steps++ < MAX_LOG_SCAN && out.length < cap) {
-      const myOid = this.pathOid(cur.commit, path);
-      const parent = cur.commit.parents[0] ? this.peelToCommit(cur.commit.parents[0]) : null;
-      const parentOid = parent ? this.pathOid(parent.commit, path) : null;
+      const myOid = await this.pathOid(cur.commit, path);
+      const parent = cur.commit.parents[0] ? await this.peelToCommit(cur.commit.parents[0]) : null;
+      const parentOid = parent ? await this.pathOid(parent.commit, path) : null;
       if (myOid !== parentOid) {
-        const blob = myOid ? this.store.get(myOid) : null;
+        const blob = myOid ? await this.store.get(myOid) : null;
         const data = blob?.type === "blob" ? blob.data : null;
         if (data) {
           bytes += data.length;
@@ -720,7 +818,7 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Map oid -> decorations (branch/tag pointing at it). */
-  private decorations(repo: string): Map<string, string> {
+  private async decorations(repo: string): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     const r = `/${encodeURIComponent(repo)}`;
     for (const ref of this.store.refs()) {
@@ -729,7 +827,7 @@ export class RepoCell extends DurableObject<Env> {
       if (ref.name.startsWith("refs/heads/")) {
         html = `<a class='branch-deco' href='${r}/log/?h=${encodeURIComponent(ref.name.slice(11))}'>${esc(ref.name.slice(11))}</a>`;
       } else if (ref.name.startsWith("refs/tags/")) {
-        const peeled = this.peelToCommit(ref.target);
+        const peeled = await this.peelToCommit(ref.target);
         if (peeled) target = peeled.oid;
         html = `<a class='tag-deco' href='${r}/tag/?h=${encodeURIComponent(ref.name.slice(10))}'>${esc(ref.name.slice(10))}</a>`;
       } else continue;
@@ -738,13 +836,13 @@ export class RepoCell extends DurableObject<Env> {
     return map;
   }
 
-  private lookupPath(
+  private async lookupPath(
     rootTree: string,
     path: string[]
-  ): { kind: "tree"; entries: TreeEntry[] } | { kind: "blob"; entry: TreeEntry } | null {
+  ): Promise<{ kind: "tree"; entries: TreeEntry[] } | { kind: "blob"; entry: TreeEntry } | null> {
     let treeOid = rootTree;
     for (let i = 0; i < path.length; i++) {
-      const obj = this.store.get(treeOid);
+      const obj = await this.store.get(treeOid);
       if (obj?.type !== "tree") return null;
       const entry = parseTree(obj.data).find((e) => e.name === path[i]);
       if (!entry) return null;
@@ -754,17 +852,17 @@ export class RepoCell extends DurableObject<Env> {
       if (!isTreeMode(entry.mode)) return null;
       treeOid = entry.oid;
     }
-    const obj = this.store.get(treeOid);
+    const obj = await this.store.get(treeOid);
     if (obj?.type !== "tree") return null;
     return { kind: "tree", entries: parseTree(obj.data) };
   }
 
-  private findReadme(): { name: string; oid: string } | null {
+  private async findReadme(): Promise<{ name: string; oid: string } | null> {
     const head = this.store.resolveHead();
     if (!head) return null;
-    const c = this.peelToCommit(head);
+    const c = await this.peelToCommit(head);
     if (!c) return null;
-    const root = this.store.get(c.commit.tree);
+    const root = await this.store.get(c.commit.tree);
     if (root?.type !== "tree") return null;
     const entries = parseTree(root.data);
     for (const want of README_NAMES) {
@@ -774,22 +872,22 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private flattenTree(treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>): void {
-    const obj = this.store.get(treeOid);
+  private async flattenTree(treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>): Promise<void> {
+    const obj = await this.store.get(treeOid);
     if (obj?.type !== "tree") return;
     for (const e of parseTree(obj.data)) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
-      if (isTreeMode(e.mode)) this.flattenTree(e.oid, p, out);
+      if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out);
       else if (!isGitlinkMode(e.mode)) out.set(p, { oid: e.oid, mode: e.mode });
     }
   }
 
 
-  private computeDiff(oldTree: string | null, newTree: string): { files: FileDiff[]; truncated: boolean } {
+  private async computeDiff(oldTree: string | null, newTree: string): Promise<{ files: FileDiff[]; truncated: boolean }> {
     const oldFiles = new Map<string, { oid: string; mode: string }>();
     const newFiles = new Map<string, { oid: string; mode: string }>();
-    if (oldTree) this.flattenTree(oldTree, "", oldFiles);
-    this.flattenTree(newTree, "", newFiles);
+    if (oldTree) await this.flattenTree(oldTree, "", oldFiles);
+    await this.flattenTree(newTree, "", newFiles);
     const paths = [...new Set([...oldFiles.keys(), ...newFiles.keys()])].sort();
     const files: FileDiff[] = [];
     let truncated = false;
@@ -801,8 +899,8 @@ export class RepoCell extends DurableObject<Env> {
         truncated = true;
         break;
       }
-      const oldData = o ? this.store.get(o.oid)?.data ?? new Uint8Array(0) : new Uint8Array(0);
-      const newData = n ? this.store.get(n.oid)?.data ?? new Uint8Array(0) : new Uint8Array(0);
+      const oldData = o ? (await this.store.get(o.oid))?.data ?? new Uint8Array(0) : new Uint8Array(0);
+      const newData = n ? (await this.store.get(n.oid))?.data ?? new Uint8Array(0) : new Uint8Array(0);
       const fd: FileDiff = { path: p, o, n, kind: "text", ops: null, hunks: [], add: 0, del: 0 };
       if (isBinary(oldData) || isBinary(newData)) {
         fd.kind = "binary";
@@ -897,11 +995,11 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
   }
 
 
-  private aboutPage(repo: string, h: string | undefined): Response {
-    const base = this.base(repo, "about", h, `/${encodeURIComponent(repo)}/about/`);
-    const readme = this.findReadme();
+  private async aboutPage(repo: string, h: string | undefined): Promise<Response> {
+    const base = await this.base(repo, "about", h, `/${encodeURIComponent(repo)}/about/`);
+    const readme = await this.findReadme();
     if (!readme) return errorPage(base, "no readme found");
-    const obj = this.store.get(readme.oid);
+    const obj = await this.store.get(readme.oid);
     if (!obj) return errorPage(base, "missing readme blob");
     const text = td.decode(obj.data);
     const lower = readme.name.toLowerCase();
@@ -912,8 +1010,8 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private summaryPage(repo: string, host: string, proto: string): Response {
-    const base = this.base(repo, "summary");
+  private async summaryPage(repo: string, host: string, proto: string): Promise<Response> {
+    const base = await this.base(repo, "summary");
     const branches = this.store.refs().filter((r) => r.name.startsWith("refs/heads/"));
     const tags = this.store.refs().filter((r) => r.name.startsWith("refs/tags/"));
     const r = `/${encodeURIComponent(repo)}`;
@@ -930,23 +1028,23 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
       );
     }
 
-    const branchRows = branches
+    const branchRows = (await Promise.all(branches
       .slice(0, 10)
-      .map((b) => {
+      .map(async (b) => {
         const name = b.name.slice(11);
-        const c = this.peelToCommit(b.target);
+        const c = await this.peelToCommit(b.target);
         if (!c) return "";
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td><a href='${r}/commit/?id=${c.oid}'>${esc(c.commit.subject)}</a></td>` +
           `<td>${esc(c.commit.author.name)}</td><td>${age(c.commit.committer.time)}</td></tr>`;
-      })
+      })))
       .join("");
 
-    const tagRows = tags
+    const tagRows = (await Promise.all(tags
       .slice(0, 10)
-      .map((t) => {
+      .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = this.store.get(t.target);
+        const obj = await this.store.get(t.target);
         let when = 0;
         let target = t.target;
         if (obj?.type === "tag") {
@@ -954,19 +1052,19 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
           when = tag.tagger?.time ?? 0;
           target = tag.object;
         }
-        const c = this.peelToCommit(target);
+        const c = await this.peelToCommit(target);
         if (c && !when) when = c.commit.committer.time;
         const snap = `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
           `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/tag/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td><a href='${r}/commit/?id=${target}'>${esc(c?.commit.subject ?? "")}</a></td>` +
           `<td>${esc(c?.commit.author.name ?? "")}</td><td>${age(when)}</td><td class='snapshots'>${snap}</td></tr>`;
-      })
+      })))
       .join("");
 
     const headOid = this.store.resolveHead();
-    const recent = headOid ? this.walkLog(headOid, 0, 10).entries : [];
-    const deco = this.decorations(repo);
+    const recent = headOid ? (await this.walkLog(headOid, 0, 10)).entries : [];
+    const deco = await this.decorations(repo);
     const logRows = recent
       .map(
         (e) =>
@@ -991,18 +1089,18 @@ ${logRows}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private logPage(repo: string, h: string | undefined, ofs: number, filter: LogFilter): Response {
+  private async logPage(repo: string, h: string | undefined, ofs: number, filter: LogFilter): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "log", h, `${r}/log/`);
+    const base = await this.base(repo, "log", h, `${r}/log/`);
     let tip = h;
     if (filter.qt === "range" && filter.q) {
       tip = filter.q;
       filter = {};
     }
-    const rr = this.resolveRef(tip);
+    const rr = await this.resolveRef(tip);
     if (!rr) return errorPage(base, tip ? `bad ref: ${tip}` : "empty repository");
-    const { entries, more } = this.walkLog(rr.oid, ofs, LOG_PAGE, filter);
-    const deco = this.decorations(repo);
+    const { entries, more } = await this.walkLog(rr.oid, ofs, LOG_PAGE, filter);
+    const deco = await this.decorations(repo);
     const rows = entries
       .map(
         (e) =>
@@ -1049,27 +1147,27 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private refsPage(repo: string): Response {
+  private async refsPage(repo: string): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "refs", undefined, `${r}/refs/`);
+    const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
     const refs = this.store.refs();
     const branches = refs.filter((x) => x.name.startsWith("refs/heads/"));
     const tags = refs.filter((x) => x.name.startsWith("refs/tags/"));
-    const branchRows = branches
-      .map((b) => {
+    const branchRows = (await Promise.all(branches
+      .map(async (b) => {
         const name = b.name.slice(11);
-        const c = this.peelToCommit(b.target);
+        const c = await this.peelToCommit(b.target);
         const snap = `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
           `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td class='sha1'><a href='${r}/commit/?id=${b.target}'>${b.target.slice(0, 10)}</a></td>` +
           `<td>${esc(c?.commit.author.name ?? "")}</td><td>${c ? age(c.commit.committer.time) : ""}</td><td class='snapshots'>${snap}</td></tr>`;
-      })
+      })))
       .join("");
-    const tagRows = tags
-      .map((t) => {
+    const tagRows = (await Promise.all(tags
+      .map(async (t) => {
         const name = t.name.slice(10);
-        const obj = this.store.get(t.target);
+        const obj = await this.store.get(t.target);
         let when = 0;
         let who = "";
         let target = t.target;
@@ -1088,7 +1186,7 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
         return `<tr><td><a href='${r}/tag/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td class='sha1'><a href='${r}/commit/?id=${target}'>${target.slice(0, 10)}</a></td>` +
           `<td>${esc(who)}</td><td>${age(when)}</td><td class='snapshots'>${snap}</td></tr>`;
-      })
+      })))
       .join("");
     const body = `
 <table class='list nowrap'>
@@ -1112,14 +1210,14 @@ ${tagRows || "<tr class='nohover'><td colspan='5'>none</td></tr>"}
     return html;
   }
 
-  private treePage(repo: string, h: string | undefined, path: string[]): Response {
+  private async treePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "tree", h, `${r}/tree/${path.map(encodeURIComponent).join("/")}`);
-    const rr = this.resolveRef(h);
+    const base = await this.base(repo, "tree", h, `${r}/tree/${path.map(encodeURIComponent).join("/")}`);
+    const rr = await this.resolveRef(h);
     if (!rr) return errorPage(base, h ? `bad ref: ${h}` : "empty repository");
-    const head = this.peelToCommit(rr.oid);
+    const head = await this.peelToCommit(rr.oid);
     if (!head) return errorPage(base, "no commit found");
-    const found = this.lookupPath(head.commit.tree, path);
+    const found = await this.lookupPath(head.commit.tree, path);
     if (!found) return errorPage(base, `path not found: ${path.join("/")}`);
     const withPath = { ...base, pathBar: this.pathBar(repo, h, path) };
 
@@ -1153,14 +1251,14 @@ ${rows}
     return htmlResponse(layout({ ...withPath, body }));
   }
 
-  private blobPage(
+  private async blobPage(
     repo: string,
     h: string | undefined,
     path: string[],
     entry: TreeEntry,
     base: Omit<LayoutOpts, "body">
-  ): Response {
-    const obj = this.store.get(entry.oid);
+  ): Promise<Response> {
+    const obj = await this.store.get(entry.oid);
     if (!obj) return errorPage(base, "missing blob");
     const r = `/${encodeURIComponent(repo)}`;
     const q = h ? `?h=${encodeURIComponent(h)}` : "";
@@ -1182,22 +1280,22 @@ ${rows}
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private blamePage(repo: string, h: string | undefined, path: string[]): Response {
+  private async blamePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "tree", h, `${r}/blame/${path.map(encodeURIComponent).join("/")}`);
+    const base = await this.base(repo, "tree", h, `${r}/blame/${path.map(encodeURIComponent).join("/")}`);
     const withPath = { ...base, pathBar: this.pathBar(repo, h, path) };
-    const rr = this.resolveRef(h);
+    const rr = await this.resolveRef(h);
     if (!rr) return errorPage(withPath, "empty repository");
     if (!path.length) return errorPage(withPath, "blame needs a file path");
     // size-gate the tip blob before walking history: a large file would
     // otherwise load up to 200 full revisions into memory before blame() bails
-    const tip = this.peelToCommit(rr.oid);
+    const tip = await this.peelToCommit(rr.oid);
     if (!tip) return errorPage(withPath, "no commit found");
-    const tipOid = this.pathOid(tip.commit, path);
+    const tipOid = await this.pathOid(tip.commit, path);
     const meta = tipOid ? this.store.typeAndSize(tipOid) : null;
     if (!meta || meta.type !== "blob") return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (meta.size > MAX_BLAME_BYTES) return errorPage(withPath, "blame skipped: file too large");
-    const history = this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES);
+    const history = await this.pathHistory(rr.oid, path, 200, MAX_BLAME_HISTORY_BYTES);
     if (!history.length || !history[0].blob) return errorPage(withPath, `no such file: ${path.join("/")}`);
     if (isBinary(history[0].blob)) return errorPage(withPath, "cannot blame a binary file");
     const result = blame(history);
@@ -1223,37 +1321,37 @@ ${rows}
     return htmlResponse(layout({ ...withPath, body }));
   }
 
-  private plainPage(h: string | undefined, path: string[]): Response {
-    const rr = this.resolveRef(h);
+  private async plainPage(h: string | undefined, path: string[]): Promise<Response> {
+    const rr = await this.resolveRef(h);
     if (!rr) return new Response("not found\n", { status: 404 });
-    const head = this.peelToCommit(rr.oid);
+    const head = await this.peelToCommit(rr.oid);
     if (!head) return new Response("not found\n", { status: 404 });
-    const found = this.lookupPath(head.commit.tree, path);
+    const found = await this.lookupPath(head.commit.tree, path);
     if (!found || found.kind !== "blob") return new Response("not found\n", { status: 404 });
-    const obj = this.store.get(found.entry.oid);
+    const obj = await this.store.get(found.entry.oid);
     if (!obj) return new Response("not found\n", { status: 404 });
     return rawBlobResponse(obj.data, path[path.length - 1] ?? "");
   }
 
-  private blobByIdPage(id: string): Response {
-    const oid = this.resolveServable(id);
+  private async blobByIdPage(id: string): Promise<Response> {
+    const oid = await this.resolveServable(id);
     if (!oid) return new Response("not found\n", { status: 404 });
-    const obj = this.store.get(oid);
+    const obj = await this.store.get(oid);
     if (!obj || obj.type !== "blob") return new Response("not a blob\n", { status: 404 });
     return rawBlobResponse(obj.data, "");
   }
 
-  private commitPage(repo: string, id: string | undefined, h: string | undefined): Response {
+  private async commitPage(repo: string, id: string | undefined, h: string | undefined): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "commit", h, `${r}/commit/`);
-    const oid = this.resolveCommitId(id, h);
+    const base = await this.base(repo, "commit", h, `${r}/commit/`);
+    const oid = await this.resolveCommitId(id, h);
     if (!oid) return errorPage(base, "commit not found");
-    const commit = this.loadCommit(oid);
+    const commit = await this.loadCommit(oid);
     if (!commit) return errorPage(base, `commit not found: ${oid}`);
 
-    const parent = commit.parents[0] ? this.loadCommit(commit.parents[0]) : null;
-    const { files, truncated } = this.computeDiff(parent?.tree ?? null, commit.tree);
-    const deco = this.decorations(repo);
+    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0]) : null;
+    const { files, truncated } = await this.computeDiff(parent?.tree ?? null, commit.tree);
+    const deco = await this.decorations(repo);
 
     const body = `
 <table class='commit-info'>
@@ -1270,30 +1368,30 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private resolveCommitId(id: string | undefined, h: string | undefined): string | null {
+  private async resolveCommitId(id: string | undefined, h: string | undefined): Promise<string | null> {
     if (id) {
-      const full = this.resolveServable(id);
-      return full ? this.peelToCommit(full)?.oid ?? null : null;
+      const full = await this.resolveServable(id);
+      return full ? (await this.peelToCommit(full))?.oid ?? null : null;
     }
-    const rr = this.resolveRef(h);
-    return rr ? this.peelToCommit(rr.oid)?.oid ?? null : null;
+    const rr = await this.resolveRef(h);
+    return rr ? (await this.peelToCommit(rr.oid))?.oid ?? null : null;
   }
 
   /** diff/rawdiff: changes id2..id (default id2 = first parent of id). */
-  private diffPage(repo: string, id: string | undefined, id2: string | undefined, h: string | undefined, raw: boolean): Response {
-    const base = this.base(repo, "diff", h, `/${encodeURIComponent(repo)}/diff/`);
-    const newOid = this.resolveCommitId(id, h);
+  private async diffPage(repo: string, id: string | undefined, id2: string | undefined, h: string | undefined, raw: boolean): Promise<Response> {
+    const base = await this.base(repo, "diff", h, `/${encodeURIComponent(repo)}/diff/`);
+    const newOid = await this.resolveCommitId(id, h);
     if (!newOid) return raw ? new Response("not found\n", { status: 404 }) : errorPage(base, "commit not found");
-    const commit = this.loadCommit(newOid)!;
+    const commit = (await this.loadCommit(newOid))!;
     let oldOid: string | null = null;
     if (id2) {
-      oldOid = this.resolveCommitId(id2, undefined);
+      oldOid = await this.resolveCommitId(id2, undefined);
       if (!oldOid) return raw ? new Response("bad id2\n", { status: 404 }) : errorPage(base, `bad id2: ${id2}`);
     } else {
       oldOid = commit.parents[0] ?? null;
     }
-    const oldCommit = oldOid ? this.loadCommit(oldOid) : null;
-    const { files, truncated } = this.computeDiff(oldCommit?.tree ?? null, commit.tree);
+    const oldCommit = oldOid ? await this.loadCommit(oldOid) : null;
+    const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, commit.tree);
     if (raw) {
       return new Response(this.renderRawDiff(files), { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
@@ -1304,12 +1402,12 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
   }
 
   /** git-format-patch style output, applies with `git am`. */
-  private patchPage(repo: string, id: string | undefined, h: string | undefined): Response {
-    const oid = this.resolveCommitId(id, h);
+  private async patchPage(repo: string, id: string | undefined, h: string | undefined): Promise<Response> {
+    const oid = await this.resolveCommitId(id, h);
     if (!oid) return new Response("not found\n", { status: 404 });
-    const commit = this.loadCommit(oid)!;
-    const parent = commit.parents[0] ? this.loadCommit(commit.parents[0]) : null;
-    const { files } = this.computeDiff(parent?.tree ?? null, commit.tree);
+    const commit = (await this.loadCommit(oid))!;
+    const parent = commit.parents[0] ? await this.loadCommit(commit.parents[0]) : null;
+    const { files } = await this.computeDiff(parent?.tree ?? null, commit.tree);
     const bodyText = commit.message.split("\n").slice(1).join("\n").trim();
     let statLines = "";
     let totalAdd = 0, totalDel = 0;
@@ -1334,13 +1432,13 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
     return new Response(patch, { headers: { "content-type": "text/plain; charset=utf-8" } });
   }
 
-  private tagPage(repo: string, name: string | undefined): Response {
+  private async tagPage(repo: string, name: string | undefined): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "refs", undefined, `${r}/refs/`);
+    const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
     if (!name) return errorPage(base, "no tag given");
-    const target = this.store.getRef(`refs/tags/${name}`) ?? this.resolveServable(name);
+    const target = this.store.getRef(`refs/tags/${name}`) ?? (await this.resolveServable(name));
     if (!target) return errorPage(base, `tag not found: ${name}`);
-    const obj = this.store.get(target);
+    const obj = await this.store.get(target);
     if (!obj) return errorPage(base, `missing object`);
     let body: string;
     if (obj.type === "tag") {
@@ -1363,7 +1461,7 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     return htmlResponse(layout({ ...base, body }));
   }
 
-  private snapshotPage(repo: string, filename: string): Response {
+  private async snapshotPage(repo: string, filename: string): Promise<Response> {
     let format: "tar.gz" | "zip";
     let stem: string;
     if (filename.endsWith(".tar.gz")) {
@@ -1384,20 +1482,20 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     for (const c of [...candidates]) candidates.push(`v${c}`);
     let commit: { oid: string; commit: Commit } | null = null;
     for (const cand of candidates) {
-      const rr = this.resolveRef(cand);
+      const rr = await this.resolveRef(cand);
       if (rr) {
-        commit = this.peelToCommit(rr.oid);
+        commit = await this.peelToCommit(rr.oid);
         if (commit) break;
       }
     }
     if (!commit) return new Response(`no ref matches snapshot name: ${stem}\n`, { status: 404 });
 
     const flat = new Map<string, { oid: string; mode: string }>();
-    this.flattenTree(commit.commit.tree, "", flat);
+    await this.flattenTree(commit.commit.tree, "", flat);
     const files: SnapshotFile[] = [];
     let total = 0;
     for (const [path, info] of flat) {
-      const obj = this.store.get(info.oid);
+      const obj = await this.store.get(info.oid);
       if (!obj) continue;
       total += obj.data.length;
       if (total > MAX_SNAPSHOT_BYTES) {
@@ -1422,10 +1520,10 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     });
   }
 
-  private atomPage(repo: string, host: string, proto: string, h: string | undefined): Response {
-    const rr = this.resolveRef(h);
+  private async atomPage(repo: string, host: string, proto: string, h: string | undefined): Promise<Response> {
+    const rr = await this.resolveRef(h);
     if (!rr) return new Response("empty repository\n", { status: 404 });
-    const { entries } = this.walkLog(rr.oid, 0, 20);
+    const { entries } = await this.walkLog(rr.oid, 0, 20);
     const abs = `${proto}://${host}/${encodeURIComponent(repo)}`;
     const iso = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
     const updated = entries[0] ? iso(entries[0].commit.committer.time) : iso(0);
@@ -1460,13 +1558,13 @@ ${items}
    * History under an immutable commit oid never changes, so a cache hit
    * needs no version check — only the pair itself as key.
    */
-  private computeStats(
+  private async computeStats(
     tipOid: string,
     period: string
-  ): { periodKeys: string[]; authors: { name: string; counts: Record<string, number> }[]; totals: Record<string, number>; count: number } {
+  ): Promise<{ periodKeys: string[]; authors: { name: string; counts: Record<string, number> }[]; totals: Record<string, number>; count: number }> {
     const cached = this.store.getStatsCache(tipOid, period);
     if (cached) return JSON.parse(cached);
-    const { entries } = this.walkLog(tipOid, 0, MAX_STATS_SCAN);
+    const { entries } = await this.walkLog(tipOid, 0, MAX_STATS_SCAN);
     const keyOf = (t: number): string => {
       const d = new Date(t * 1000);
       if (period === "y") return String(d.getUTCFullYear());
@@ -1504,12 +1602,12 @@ ${items}
     return result;
   }
 
-  private statsPage(repo: string, h: string | undefined, period: string): Response {
+  private async statsPage(repo: string, h: string | undefined, period: string): Promise<Response> {
     const r = `/${encodeURIComponent(repo)}`;
-    const base = this.base(repo, "stats", h, `${r}/stats/`);
-    const rr = this.resolveRef(h);
+    const base = await this.base(repo, "stats", h, `${r}/stats/`);
+    const rr = await this.resolveRef(h);
     if (!rr) return errorPage(base, "empty repository");
-    const agg = this.computeStats(rr.oid, period);
+    const agg = await this.computeStats(rr.oid, period);
 
     const cols = agg.periodKeys.slice(0, 8);
     const authors = agg.authors
