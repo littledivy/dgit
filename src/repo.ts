@@ -20,6 +20,7 @@ import {
 } from "./git/protocol";
 import {
   Commit,
+  Person,
   parseCommit,
   parseTag,
   parseTree,
@@ -53,6 +54,8 @@ const DO_STORAGE_CAP = 10 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PUSH_MB = 512;
 /** an upload-pack request is wants/haves/caps only — a few hundred KB at most */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
+/** encoded-byte budget for the x-ref-updates response header */
+const MAX_REF_UPDATES_HEADER = 8 * 1024;
 // like cgit's about-file: a dedicated about page wins over the README
 const README_NAMES = [
   "about.md",
@@ -74,6 +77,55 @@ interface LogFilter {
   path?: string[];
   qt?: string;
   q?: string;
+}
+
+/** a ref update a push actually applied (threaded to the Worker's onPush hook) */
+interface AppliedUpdate {
+  ref: string;
+  old: string;
+  new: string;
+}
+
+// The shapes returned by the cell's typed content surface (see the methods
+// below currentPackKey).
+
+export interface RefsResult {
+  head: string | null;
+  refs: { name: string; target: string; peeled?: string }[];
+}
+
+export interface CommitJson {
+  oid: string;
+  tree: string;
+  parents: string[];
+  author: Person;
+  committer: Person;
+  subject: string;
+  message: string;
+}
+
+export interface LogResult {
+  commits: CommitJson[];
+  more: boolean;
+}
+
+export interface TreeEntryJson {
+  name: string;
+  mode: string;
+  type: "tree" | "blob" | "commit";
+  oid: string;
+  size?: number;
+}
+
+export interface TreeResult {
+  oid: string;
+  entries: TreeEntryJson[];
+}
+
+export interface BlobResult {
+  oid: string;
+  mode: string;
+  data: Uint8Array;
 }
 
 interface FileDiff {
@@ -361,6 +413,122 @@ export class RepoCell extends DurableObject<Env> {
     return `pack/${repo}/${this.store.reachableVersion()}`;
   }
 
+  // ---- typed content surface ----------------------------------------------
+  // Public methods callable two ways: over HTTP as /<repo>/api/* (JSON; the
+  // Worker's authorize gate applies) and directly as Workers RPC by any
+  // same-account Worker holding the REPO binding — that path carries no HTTP
+  // auth, a service binding is already trusted infrastructure.
+
+  /**
+   * Rebind R2 for a direct RPC call, which has no request to read x-repo from;
+   * the name was persisted by the first push (absent before any push, when
+   * there are no R2-backed packs to read either).
+   */
+  private rpcBind(): void {
+    const name = this.store.getMeta("repo");
+    if (name) this.bindR2(name);
+  }
+
+  async listRefs(): Promise<RefsResult> {
+    this.rpcBind();
+    const refs: RefsResult["refs"] = [];
+    for (const r of this.store.refs()) {
+      const entry: RefsResult["refs"][number] = { name: r.name, target: r.target };
+      if (r.name.startsWith("refs/tags/")) {
+        const peeled = await this.peelToCommit(r.target);
+        if (peeled && peeled.oid !== r.target) entry.peeled = peeled.oid;
+      }
+      refs.push(entry);
+    }
+    return { head: this.store.resolveHead() ? this.store.head() : null, refs };
+  }
+
+  /** `id` is a branch, tag, full ref, or reachable oid; absent means HEAD. */
+  async readCommit(id?: string): Promise<CommitJson | null> {
+    this.rpcBind();
+    const rr = await this.resolveRef(id);
+    if (!rr) return null;
+    const c = await this.peelToCommit(rr.oid);
+    return c ? commitJson(c.oid, c.commit) : null;
+  }
+
+  async listLog(ref?: string, opts: { path?: string; ofs?: number; n?: number } = {}): Promise<LogResult> {
+    this.rpcBind();
+    const rr = await this.resolveRef(ref);
+    if (!rr) return { commits: [], more: false };
+    const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
+    const ofs = Math.max(opts.ofs ?? 0, 0);
+    const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
+    const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter);
+    return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
+  }
+
+  async listTree(ref?: string, path = ""): Promise<TreeResult | null> {
+    this.rpcBind();
+    const rr = await this.resolveRef(ref);
+    if (!rr) return null;
+    const head = await this.peelToCommit(rr.oid);
+    if (!head) return null;
+    const segs = decodePath("/" + path);
+    const found = await this.lookupPath(head.commit.tree, segs);
+    if (!found || found.kind !== "tree") return null;
+    const entries: TreeEntryJson[] = found.entries.map((e) => {
+      const type = isTreeMode(e.mode) ? ("tree" as const) : isGitlinkMode(e.mode) ? ("commit" as const) : ("blob" as const);
+      const out: TreeEntryJson = { name: e.name, mode: e.mode, type, oid: e.oid };
+      const meta = type === "blob" ? this.store.typeAndSize(e.oid) : null;
+      if (meta) out.size = meta.size;
+      return out;
+    });
+    return { oid: found.oid, entries };
+  }
+
+  async readBlob(ref: string | undefined, path: string): Promise<BlobResult | null> {
+    this.rpcBind();
+    const rr = await this.resolveRef(ref);
+    if (!rr) return null;
+    const head = await this.peelToCommit(rr.oid);
+    if (!head) return null;
+    const found = await this.lookupPath(head.commit.tree, decodePath("/" + path));
+    if (!found || found.kind !== "blob") return null;
+    const obj = await this.store.get(found.entry.oid);
+    if (!obj || obj.type !== "blob") return null;
+    return { oid: found.entry.oid, mode: found.entry.mode, data: obj.data };
+  }
+
+  /** The content methods over HTTP. GET-only; routed from ui(). */
+  private async api(path: string, q: URLSearchParams): Promise<Response> {
+    const h = q.get("h") ?? undefined;
+    const json = (data: unknown, status = 200) =>
+      Response.json(data, { status, headers: { "x-content-type-options": "nosniff" } });
+    const notFound = (what: string) => json({ error: what }, 404);
+    if (path === "/api/refs") return json(await this.listRefs());
+    if (path === "/api/log") {
+      return json(
+        await this.listLog(h, {
+          path: q.get("path") ?? undefined,
+          ofs: parseInt(q.get("ofs") ?? "0", 10) || 0,
+          n: parseInt(q.get("n") ?? "", 10) || undefined,
+        })
+      );
+    }
+    if (path === "/api/commit") {
+      const c = await this.readCommit(q.get("id") ?? h);
+      return c ? json(c) : notFound("commit not found");
+    }
+    if (path === "/api/tree") {
+      const t = await this.listTree(h, q.get("path") ?? "");
+      return t ? json(t) : notFound("tree not found");
+    }
+    if (path === "/api/blob") {
+      const blob = await this.readBlob(h, q.get("path") ?? "");
+      if (!blob) return notFound("blob not found");
+      const res = rawBlobResponse(blob.data, (q.get("path") ?? "").split("/").pop() ?? "");
+      res.headers.set("x-oid", blob.oid);
+      return res;
+    }
+    return notFound(`no such endpoint: ${path}`);
+  }
+
   /**
    * R2 full-clone offload adapter (write side), or undefined when no bucket is
    * bound (celld and Workers without the binding both fall back to the pure DO
@@ -450,8 +618,9 @@ export class RepoCell extends DurableObject<Env> {
       () => {}
     );
     let commitTime: number | null;
+    let updates: AppliedUpdate[];
     try {
-      commitTime = await run;
+      ({ commitTime, updates } = await run);
     } catch (err) {
       console.log(`[receive ${repo}] FAILED: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
       const msg = err instanceof Error ? err.message : String(err);
@@ -467,6 +636,20 @@ export class RepoCell extends DurableObject<Env> {
     if (commitTime !== null) {
       headers["x-changed"] = "1";
       headers["x-commit-time"] = String(commitTime);
+      // the applied ref updates, for the Worker's onPush hook. URI-encoded to
+      // stay header-safe. The cap is on encoded bytes, not entries: ref names
+      // are attacker-controlled up to 255 chars and non-ASCII encodes at 9
+      // bytes per char, so an entry-count cap could still blow the response
+      // header budget. Halve until it fits; the hook sees a truncated list.
+      let take = updates;
+      let encoded = encodeURIComponent(JSON.stringify(take));
+      while (encoded.length > MAX_REF_UPDATES_HEADER && take.length > 1) {
+        take = take.slice(0, Math.ceil(take.length / 2));
+        encoded = encodeURIComponent(JSON.stringify(take));
+      }
+      if (take.length && encoded.length <= MAX_REF_UPDATES_HEADER) {
+        headers["x-ref-updates"] = encoded;
+      }
     }
     return new Response(concat(chunks) as unknown as BodyInit, { headers });
   }
@@ -476,7 +659,7 @@ export class RepoCell extends DurableObject<Env> {
     repo: string,
     maxBytes: number,
     emit: (chunk: Uint8Array) => void
-  ): Promise<number | null> {
+  ): Promise<{ commitTime: number | null; updates: AppliedUpdate[] }> {
     console.log(`[receive ${repo}] processing push request`);
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let buf: Uint8Array;
@@ -579,7 +762,15 @@ export class RepoCell extends DurableObject<Env> {
       }
     }
     if (wantStatus) emit(renderStatus(results, unpackError, sideband));
-    return commitTime;
+    // the updates a push actually applied. results[i] is the outcome of
+    // commands[i] (validatePush and commitPush each emit exactly one entry per
+    // input, in order) — the join must be by index, not ref name: a crafted
+    // request can send two commands for the same ref, and a name join would
+    // let the rejected one inherit the applied one's success
+    const updates = commands
+      .filter((_, i) => results[i]?.ok === true)
+      .map((c) => ({ ref: c.ref, old: c.old, new: c.next }));
+    return { commitTime, updates };
   }
 
 
@@ -606,6 +797,7 @@ export class RepoCell extends DurableObject<Env> {
 
   private async ui(repo: string, host: string, proto: string, path: string, q: URLSearchParams): Promise<Response> {
     const h = q.get("h") ?? undefined;
+    if (path.startsWith("/api/")) return this.api(path, q);
     if (path === "/" || path === "") return this.summaryPage(repo, host, proto);
     if (path === "/about/" || path === "/about") return this.aboutPage(repo, h);
     if (path === "/log/" || path === "/log")
@@ -850,7 +1042,7 @@ export class RepoCell extends DurableObject<Env> {
   private async lookupPath(
     rootTree: string,
     path: string[]
-  ): Promise<{ kind: "tree"; entries: TreeEntry[] } | { kind: "blob"; entry: TreeEntry } | null> {
+  ): Promise<{ kind: "tree"; oid: string; entries: TreeEntry[] } | { kind: "blob"; entry: TreeEntry } | null> {
     let treeOid = rootTree;
     for (let i = 0; i < path.length; i++) {
       const obj = await this.store.get(treeOid);
@@ -865,7 +1057,7 @@ export class RepoCell extends DurableObject<Env> {
     }
     const obj = await this.store.get(treeOid);
     if (obj?.type !== "tree") return null;
-    return { kind: "tree", entries: parseTree(obj.data) };
+    return { kind: "tree", oid: treeOid, entries: parseTree(obj.data) };
   }
 
   private async findReadme(): Promise<{ name: string; oid: string } | null> {
@@ -1695,7 +1887,9 @@ function rawBlobResponse(data: Uint8Array, name: string): Response {
     png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
     svg: "text/plain; charset=utf-8", pdf: "application/pdf", html: "text/plain",
   };
-  const ct = types[ext] ?? (isBinary(data) ? "application/octet-stream" : "text/plain; charset=utf-8");
+  // hasOwn: ext is attacker-named, and a bare index would reach prototype
+  // members for names like "constructor"
+  const ct = (Object.hasOwn(types, ext) ? types[ext] : undefined) ?? (isBinary(data) ? "application/octet-stream" : "text/plain; charset=utf-8");
   return new Response(data as unknown as BodyInit, {
     headers: {
       "content-type": ct,
@@ -1703,6 +1897,18 @@ function rawBlobResponse(data: Uint8Array, name: string): Response {
       "content-disposition": "inline",
     },
   });
+}
+
+function commitJson(oid: string, c: Commit): CommitJson {
+  return {
+    oid,
+    tree: c.tree,
+    parents: c.parents,
+    author: c.author,
+    committer: c.committer,
+    subject: c.subject,
+    message: c.message,
+  };
 }
 
 function decodePath(p: string): string[] {

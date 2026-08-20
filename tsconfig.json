@@ -9,7 +9,9 @@
     "noEmit": true,
     "skipLibCheck": true,
     "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    // lets examples/ import the package by its published name
+    "paths": { "durable-git": ["./src/mod.ts"] }
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "examples/**/*.ts"]
 }

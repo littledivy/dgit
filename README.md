@@ -93,6 +93,63 @@ disposable, and a killed node's repositories come back bit-identical.
 The heap and durability-deadline variables give large single-cell
 ingests the room the defaults do not.
 
+## Build on dgit
+
+dgit is also a library, published as
+[`durable-git`](https://www.npmjs.com/package/durable-git). The deployed
+Worker above is three lines around it:
+
+```ts
+import { createDurableGit, secretsEqual } from "durable-git";
+export { RepoCell, Registry } from "durable-git";
+
+export default createDurableGit({
+  async authorize({ repo, op, private: priv, credentials, env }) {
+    if (op === "read" && !priv) return true;
+    return secretsEqual(credentials?.pass ?? "", await lookupDeployKey(env, repo));
+  },
+  onPush(event, env) {
+    return fetch("https://ci.example.com/hook", { method: "POST", body: JSON.stringify(event) });
+  },
+});
+```
+
+The package ships TypeScript source, which wrangler bundles directly;
+bind the Durable Object classes as [wrangler.jsonc](wrangler.jsonc) does
+and re-export them from your entry module.
+
+`authorize` gates every repository-scoped request — `read` (pages,
+clones, the content API), `write` (push), or `admin` (config, gc,
+delete) — ahead of the page cache and the R2 clone path. `false` sends
+the Basic challenge; a `Response` is sent verbatim. It replaces the
+stock `GIT_TOKEN` policy entirely, so the private flag protects nothing
+unless the hook consults it. `onPush` fires off the response path with
+the ref updates a push applied. [docs/api.md](docs/api.md) has the full
+contract; [examples/platform.ts](examples/platform.ts) is a multi-tenant
+host built from both.
+
+Reading a repository from code needs no git client. Every repository
+serves a JSON API, gated like its pages:
+
+```
+/myrepo/api/refs                      refs and HEAD, tags peeled
+/myrepo/api/log?h=main&path=src&n=50  commit log, filtered and paged
+/myrepo/api/commit?id=v1              one commit (branch, tag, or oid)
+/myrepo/api/tree?h=main&path=src      tree listing with blob sizes
+/myrepo/api/blob?h=main&path=a.ts     raw blob bytes (oid in x-oid)
+```
+
+and the same surface is typed RPC on the cell, for Workers holding the
+`REPO` binding — which bypasses `authorize`, so gate such routes
+yourself:
+
+```ts
+const repo = env.REPO.getByName("myrepo");
+const { head, refs } = await repo.listRefs();
+const log = await repo.listLog("main", { path: "src", n: 20 });
+const blob = await repo.readBlob("main", "src/a.ts");
+```
+
 ## Operate
 
 ```sh

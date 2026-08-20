@@ -1,0 +1,34 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing: the workflow's OIDC identity is the credential,
+      # no NPM_TOKEN secret anywhere (configured on npmjs.com under the
+      # package's Trusted Publisher settings)
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # npm >= 11.5 for OIDC publishing; node 24 bundles it
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - name: tag matches package.json
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: publish, unless the version is already on the registry
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if npm view "durable-git@$v" version >/dev/null 2>&1; then
+            echo "durable-git@$v already published, skipping"
+          else
+            npm publish
+          fi
