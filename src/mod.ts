@@ -320,7 +320,7 @@ async function serveCloneFromR2(
     req.done &&
     req.deepen === 0 &&
     req.clientShallows.length === 0 &&
-    req.caps.has("side-band-64k");
+    (req.command === "fetch" || req.caps.has("side-band-64k"));
   if (!fullClone) return null;
   let key: string | null;
   try {
@@ -338,7 +338,7 @@ async function serveCloneFromR2(
   if (!obj) return null;
   const objects = parseInt(obj.customMetadata?.objects ?? "", 10);
   if (!Number.isFinite(objects)) return null;
-  return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"));
+  return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"), req.command === "fetch");
 }
 
 function withCors(res: Response, origin: string | undefined): Response {

@@ -193,7 +193,8 @@ export class RepoCell extends DurableObject<Env> {
         if (service !== "git-upload-pack" && service !== "git-receive-pack") {
           return new Response("smart HTTP only\n", { status: 400 });
         }
-        return new Response(advertisement(this.store, service as Service) as unknown as BodyInit, {
+        const v2 = req.headers.get("git-protocol")?.split(":").some((value) => value.trim() === "version=2");
+        return new Response(advertisement(this.store, service as Service, v2) as unknown as BodyInit, {
           headers: {
             "content-type": `application/x-${service}-advertisement`,
             "cache-control": "no-cache",
@@ -766,8 +767,12 @@ export class RepoCell extends DurableObject<Env> {
         // a dedicated cache makes pack-adjacent delta bases nearly free; on
         // real Workers the whole isolate has a hard 128MB, so stay small there
         const budget = typeof caches !== "undefined" ? 16 * 1024 * 1024 : 512 * 1024 * 1024;
+        // content-length ~= pack size; it selects the R2-vs-SQLite backend before
+        // the first byte lands. Absent/unknown (chunked) leaves it undefined → SQLite.
+        const declared = parseInt(req.headers.get("content-length") ?? "", 10);
         await this.store.packs.ingest(firstPackBytes, reader, {
           maxBytes,
+          sizeHint: Number.isFinite(declared) ? declared : undefined,
           cache: new ObjCache(budget),
           onProgress: progress,
           flush: () => this.ctx.storage.sync(),

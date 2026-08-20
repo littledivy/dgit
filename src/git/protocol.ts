@@ -35,8 +35,11 @@ export interface PackCache {
   beginMultipart(key: string, objects: number): Promise<MultipartPackUpload | null>;
 }
 
-/** GET /info/refs?service=... — smart ref advertisement (protocol v0). */
-export function advertisement(store: GitStore, service: Service): Uint8Array {
+/** GET /info/refs?service=... — smart ref advertisement. */
+export function advertisement(store: GitStore, service: Service, v2 = false): Uint8Array {
+  if (v2 && service === "git-upload-pack") {
+    return concat([pkt("version 2\n"), pkt(`${AGENT}\n`), pkt("ls-refs\n"), pkt("fetch=shallow\n"), FLUSH]);
+  }
   const caps =
     service === "git-upload-pack"
       ? [
@@ -124,7 +127,7 @@ export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] 
 
 /**
  * Serve a full clone by streaming the R2-cached raw pack straight from the
- * Worker: the NAK preamble a full-clone negotiation always produces, the
+ * Worker: the protocol's pack preamble, the
  * optional band-2 progress line, then the pack re-chunked into band-1 side-band
  * frames as R2 hands it over, then flush. Framing is identical to the DO path
  * and the pack bytes are the stored bytes, so the client receives a
@@ -134,7 +137,7 @@ export function sidebandFrames(band: number, payload: Uint8Array): Uint8Array[] 
 export function streamingCloneResponse(
   body: ReadableStream<Uint8Array>,
   objects: number,
-  noProgress: boolean
+  noProgress: boolean, v2 = false
 ): Response {
   const headers = {
     "content-type": "application/x-git-upload-pack-result",
@@ -149,7 +152,7 @@ export function streamingCloneResponse(
       try {
         if (!started) {
           started = true;
-          ctrl.enqueue(pkt("NAK\n"));
+          ctrl.enqueue(pkt(v2 ? "packfile\n" : "NAK\n"));
           if (!noProgress) {
             for (const f of sidebandFrames(2, te.encode(`Enumerating objects: ${objects}, done.\n`))) ctrl.enqueue(f);
           }
@@ -174,6 +177,7 @@ export function streamingCloneResponse(
 }
 
 interface UploadRequest {
+  command: "fetch" | "ls-refs" | null;
   wants: string[];
   haves: string[];
   done: boolean;
@@ -185,6 +189,7 @@ interface UploadRequest {
 export function parseUploadRequest(body: Uint8Array): UploadRequest {
   const parser = new PktParser(body);
   const req: UploadRequest = {
+    command: null,
     wants: [],
     haves: [],
     done: false,
@@ -195,7 +200,11 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
   for (let p = parser.read(); p !== null; p = parser.read()) {
     if (p.kind !== "line") continue;
     const line = p.text;
-    if (line.startsWith("want ")) {
+    if (line === "command=fetch" || line === "command=ls-refs") {
+      req.command = line === "command=fetch" ? "fetch" : "ls-refs";
+    } else if (line === "no-progress" || line === "symrefs" || line === "peel") {
+      req.caps.add(line);
+    } else if (line.startsWith("want ")) {
       req.wants.push(line.slice(5, 45));
       // capabilities ride on the first want line
       for (const cap of line.slice(45).trim().split(" ")) if (cap) req.caps.add(cap);
@@ -210,6 +219,21 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
     }
   }
   return req;
+}
+
+async function lsRefs(store: GitStore, req: UploadRequest): Promise<Uint8Array> {
+  const lines: Uint8Array[] = [];
+  const head = store.resolveHead();
+  if (head) lines.push(pkt(`${head} HEAD${req.caps.has("symrefs") ? ` symref-target:${store.head()}` : ""}\n`));
+  for (const ref of store.refs()) {
+    let peeled = "";
+    if (req.caps.has("peel") && ref.name.startsWith("refs/tags/") && store.typeAndSize(ref.target)?.type === "tag") {
+      const oid = await peelToCommitOid(store, ref.target);
+      if (oid) peeled = ` peeled:${oid}`;
+    }
+    lines.push(pkt(`${ref.target} ${ref.name}${peeled}\n`));
+  }
+  return concat([...lines, FLUSH]);
 }
 
 /** Follow tag objects down to the underlying commit oid (or null). */
@@ -510,6 +534,11 @@ export async function uploadPack(
     "cache-control": "no-cache",
   };
   const req = parseUploadRequest(body);
+  if (req.command === "ls-refs") {
+    release();
+    return new Response(await lsRefs(store, req) as unknown as BodyInit, { headers });
+  }
+  const v2 = req.command === "fetch";
   if (!req.wants.length || req.wants.some((w) => !isOid(w))) {
     release();
     return new Response(pkt("ERR no valid wants\n") as unknown as BodyInit, { headers });
@@ -528,6 +557,7 @@ export async function uploadPack(
   // shallow section (only when the client asked to deepen)
   let commitLimit: Set<string> | null = null;
   if (req.deepen > 0) {
+    if (v2) preamble.push(pkt("shallow-info\n"));
     const clientShallowSet = new Set(req.clientShallows);
     if (req.deepen >= INFINITE_DEPTH) {
       // --unshallow: full history, everything the client thought was shallow opens up
@@ -544,8 +574,9 @@ export async function uploadPack(
         if (commits.has(s) && !boundary.has(s)) preamble.push(pkt(`unshallow ${s}\n`));
       }
     }
-    preamble.push(FLUSH);
+    preamble.push(v2 ? te.encode("0001") : FLUSH);
   }
+  if (v2 && !req.done) preamble.length = 0;
 
   // Negotiation. A round with neither haves nor done (shallow discovery) gets
   // no ack line at all — a stray NAK would desync the client's stateless
@@ -562,7 +593,13 @@ export async function uploadPack(
   const common = req.haves.filter((h) => isOid(h) && store.has(h));
   const lastCommon = common.length ? common[common.length - 1] : null;
   let sendPack = req.done;
-  if (!req.caps.has("multi_ack_detailed")) {
+  if (v2) {
+    if (req.done) preamble.push(pkt("packfile\n"));
+    else {
+      const acknowledgments = common.length ? common.map((oid) => pkt(`ACK ${oid}\n`)) : [pkt("NAK\n")];
+      preamble.push(pkt("acknowledgments\n"), ...acknowledgments, FLUSH);
+    }
+  } else if (!req.caps.has("multi_ack_detailed")) {
     if (req.done || req.haves.length) {
       preamble.push(pkt(common.length ? `ACK ${common[0]}\n` : "NAK\n"));
     }
@@ -590,7 +627,7 @@ export async function uploadPack(
     return new Response(concat(preamble) as unknown as BodyInit, { headers });
   }
 
-  const sideband = req.caps.has("side-band-64k");
+  const sideband = v2 || req.caps.has("side-band-64k");
   const noProgress = req.caps.has("no-progress");
 
   // Full-clone fast path: no haves, not shallow/deepen, and the wants are

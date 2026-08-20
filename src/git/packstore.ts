@@ -6,6 +6,10 @@ import { applyDelta } from "./pack";
 import { MultipartCapture, beginRawMultipart } from "./multipart";
 
 export const PACK_CHUNK = 1024 * 1024;
+/** a pushed pack goes to R2 only when the binding is present AND the pack is at
+ * least this large; smaller packs stay in SQLite (local ~ms writes/reads). R2's
+ * purpose is escaping the 10 GB per-DO SQLite cap, which only large repos hit. */
+export const R2_PACK_MIN_BYTES = 16 * 1024 * 1024;
 /** real Workers isolates have a hard 128MB total; self-hosted celld nodes run multi-GB heaps */
 const TIGHT_MEMORY = typeof caches !== "undefined";
 const MAX_BUFFERED_ENTRY = (TIGHT_MEMORY ? 8 : 32) * 1024 * 1024;
@@ -477,6 +481,10 @@ export class PackStore {
     reader: ReadableStreamDefaultReader<Uint8Array> | null,
     opts: {
       maxBytes: number;
+      /** push body size (content-length ~= pack size); packs this size are
+       * stored in R2 when a bucket is bound, else in SQLite. Absent/unknown
+       * (chunked pushes) picks SQLite — the small-push-fast bias. */
+      sizeHint?: number;
       cache: ObjCache;
       onProgress?: (msg: string) => void;
       /** called periodically so the runtime can flush its write buffer —
@@ -526,13 +534,15 @@ export class PackStore {
       console.log(`[ingest pack ${packId} +${Math.round((Date.now() - started) / 1000)}s] ${msg.trim()}`);
     };
 
-    // storage backend: with an R2 binding the pack bytes stream to
-    // raw/<repo>/<packId> via multipart and only the index stays in SQLite; else
-    // they go to pack_data as before. Prime the backend cache now — before
+    // storage backend: a large pack (sizeHint >= R2_PACK_MIN_BYTES) with an R2
+    // binding streams its bytes to raw/<repo>/<packId> via multipart and only the
+    // index stays in SQLite; small packs (and any push without the binding or with
+    // unknown length) go to pack_data as before. Prime the backend cache now — before
     // pack_meta exists — so phase B/C readRaw hits the right source. A refused
     // multipart begin (celld makes createMultipartUpload throw) degrades to SQLite.
     let capture: MultipartCapture | null = null;
-    if (this.r2) {
+    const wantR2 = this.r2 !== null && opts.sizeHint !== undefined && opts.sizeHint >= R2_PACK_MIN_BYTES;
+    if (this.r2 && wantR2) {
       const mp = await beginRawMultipart(this.r2.bucket, this.rawKey(packId));
       if (mp) capture = new MultipartCapture(mp);
     }
