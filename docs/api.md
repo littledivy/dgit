@@ -82,6 +82,20 @@ at-most-once, and a push updating very many refs at once arrives
 truncated (8 KB budget) — a consumer that must not miss updates
 reconciles against `/api/refs`.
 
+### ui, cors, namespaces
+
+```ts
+ui?: boolean;         // false = headless: protocol, admin, and API only; every page 404s
+cors?: string;        // access-control-allow-origin for the API; preflights answered
+namespaces?: boolean; // true = every repository is <owner>/<name>
+```
+
+Headless runs dgit as a pure git server behind your own frontend — git
+needs only `/info/refs`, `/git-upload-pack`, and `/git-receive-pack`,
+and the JSON API stays for your UI's data. With `namespaces` the
+two-segment name is the repository name everywhere: hooks, the
+registry, the API, RPC (`env.REPO.getByName("owner/name")`).
+
 ### secretsEqual(a, b)
 
 Timing-safe string comparison for hooks. `credentials.pass === secret`
@@ -105,6 +119,15 @@ leaks the match through timing.
 `id` take a branch, tag, full ref, or full 40-char oid — an oid is
 served only when reachable from a current ref. Omitted means HEAD; tags
 peel to commits.
+
+### GET /api/repos?owner=\<ns\>
+
+Site-level (not repository-scoped): public repositories, newest
+activity first, capped at 1000. `owner` filters one namespace.
+
+```json
+{ "repos": [ { "name": "alice/blog", "description": "", "owner": "", "section": "", "idle": 1787198887000 } ] }
+```
 
 ### GET /\<repo\>/api/refs
 
@@ -163,6 +186,24 @@ when `path` names a blob or nothing.
 The raw bytes, not JSON. Content type from the extension with nosniff;
 the blob's oid in the `x-oid` header.
 
+### GET /\<repo\>/api/diff?id=\<ref-or-oid\>&id2=\<ref-or-oid\>
+
+Changes id2..id; `id2` defaults to the first parent of `id`, `old` is
+null for a root commit. `binary` and `toolarge` files carry no hunks.
+
+```json
+{
+  "old": "0b520f…", "new": "c3f12e…", "truncated": false,
+  "files": [{
+    "path": "a.ts",
+    "old": null, "new": { "oid": "ad1d38…", "mode": "100644" },
+    "kind": "text", "add": 1, "del": 0,
+    "hunks": [{ "aStart": 0, "aLen": 0, "bStart": 1, "bLen": 1,
+                "ops": [{ "tag": "add", "line": "const x = 1;" }] }]
+  }]
+}
+```
+
 ## RPC
 
 The same surface as typed methods on the cell, for same-account Workers
@@ -175,6 +216,7 @@ await repo.readCommit("v1");                        // CommitJson | null
 await repo.listLog("main", { path: "src", n: 20 }); // LogResult
 await repo.listTree("main", "src");                 // TreeResult | null
 await repo.readBlob("main", "src/a.ts");            // BlobResult | null — { oid, mode, data }
+await repo.readDiff("main");                        // DiffResult | null
 ```
 
 Resolution, bounds, and reachability match the JSON API; pass
@@ -185,9 +227,8 @@ alongside `PushEvent`, `AuthContext`, `DurableGitOptions`, `Env`, and
 RPC runs no auth — a binding is trusted infrastructure. A route built
 on it gates itself: validate the name before `getByName` (an unchecked
 name materializes a billable cell per probe), check the registry, and
-hold private reads to real credentials.
-[examples/platform.ts](../examples/platform.ts) shows the pattern; the
-registry is addressed the same way:
+hold private reads to real credentials. The registry is addressed the
+same way:
 
 ```ts
 await env.REGISTRY.getByName("registry").get(repo); // RepoInfo | null

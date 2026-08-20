@@ -6,6 +6,16 @@ export function esc(s: string): string {
   return s.replace(/[&<>"'`]/g, (c) => ESCAPES[c]);
 }
 
+/** repo name as a URL path — a namespaced name's slash stays a separator */
+export function repoUrl(repo: string): string {
+  return repo.split("/").map(encodeURIComponent).join("/");
+}
+
+/** repo name as a filename stem: the last segment of a namespaced name */
+export function repoBase(repo: string): string {
+  return repo.slice(repo.lastIndexOf("/") + 1);
+}
+
 /** cgit-style relative age with its color class, e.g. "3 days" / age-days. */
 export function age(unixSecs: number): string {
   if (!unixSecs) return "";
@@ -67,7 +77,7 @@ export interface LayoutOpts {
 }
 
 export function layout(o: LayoutOpts): string {
-  const r = o.repo ? `/${encodeURIComponent(o.repo)}` : "";
+  const r = o.repo ? `/${repoUrl(o.repo)}` : "";
   const q = o.ref ? `?h=${encodeURIComponent(o.ref)}` : "";
   const tabs: [string, string][] = o.repo
     ? [

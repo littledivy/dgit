@@ -32,7 +32,7 @@ import {
 import { diffLines, toHunks, isBinary, Hunk, DiffOp } from "./git/diff";
 import { blame, BlameHistoryEntry } from "./git/blame";
 import { tarGz, zip, SnapshotFile } from "./git/snapshot";
-import { esc, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
+import { esc, repoUrl, repoBase, age, fmtDate, fmtDate2822, layout, htmlResponse, errorPage, LayoutOpts } from "./ui/html";
 import { renderMarkdown } from "./ui/markdown";
 import { highlightLines } from "./ui/highlight";
 
@@ -126,6 +126,24 @@ export interface BlobResult {
   oid: string;
   mode: string;
   data: Uint8Array;
+}
+
+export interface DiffFileJson {
+  path: string;
+  old: { oid: string; mode: string } | null;
+  new: { oid: string; mode: string } | null;
+  kind: "text" | "binary" | "toolarge";
+  add: number;
+  del: number;
+  hunks: Hunk[];
+}
+
+export interface DiffResult {
+  /** null for a root commit */
+  old: string | null;
+  new: string;
+  files: DiffFileJson[];
+  truncated: boolean;
 }
 
 interface FileDiff {
@@ -482,6 +500,32 @@ export class RepoCell extends DurableObject<Env> {
     return { oid: found.oid, entries };
   }
 
+  /** Changes id2..id (default id2 = first parent of id, like the diff page). */
+  async readDiff(id?: string, id2?: string): Promise<DiffResult | null> {
+    this.rpcBind();
+    const rr = await this.resolveRef(id);
+    if (!rr) return null;
+    const head = await this.peelToCommit(rr.oid);
+    if (!head) return null;
+    let oldOid: string | null = null;
+    if (id2) {
+      const rr2 = await this.resolveRef(id2);
+      const c2 = rr2 ? await this.peelToCommit(rr2.oid) : null;
+      if (!c2) return null;
+      oldOid = c2.oid;
+    } else {
+      oldOid = head.commit.parents[0] ?? null;
+    }
+    const oldCommit = oldOid ? await this.loadCommit(oldOid) : null;
+    const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree);
+    return {
+      old: oldOid,
+      new: head.oid,
+      truncated,
+      files: files.map((f) => ({ path: f.path, old: f.o, new: f.n, kind: f.kind, add: f.add, del: f.del, hunks: f.hunks })),
+    };
+  }
+
   async readBlob(ref: string | undefined, path: string): Promise<BlobResult | null> {
     this.rpcBind();
     const rr = await this.resolveRef(ref);
@@ -518,6 +562,10 @@ export class RepoCell extends DurableObject<Env> {
     if (path === "/api/tree") {
       const t = await this.listTree(h, q.get("path") ?? "");
       return t ? json(t) : notFound("tree not found");
+    }
+    if (path === "/api/diff") {
+      const d = await this.readDiff(q.get("id") ?? h, q.get("id2") ?? undefined);
+      return d ? json(d) : notFound("commit not found");
     }
     if (path === "/api/blob") {
       const blob = await this.readBlob(h, q.get("path") ?? "");
@@ -791,7 +839,7 @@ export class RepoCell extends DurableObject<Env> {
       ref: ref ?? headBranch,
       hasAbout: (await this.findReadme()) !== null,
       branches,
-      formAction: formAction ?? `/${encodeURIComponent(repo)}/`,
+      formAction: formAction ?? `/${repoUrl(repo)}/`,
     };
   }
 
@@ -1023,7 +1071,7 @@ export class RepoCell extends DurableObject<Env> {
   /** Map oid -> decorations (branch/tag pointing at it). */
   private async decorations(repo: string): Promise<Map<string, string>> {
     const map = new Map<string, string>();
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     for (const ref of this.store.refs()) {
       let html = "";
       let target = ref.target;
@@ -1199,7 +1247,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
 
 
   private async aboutPage(repo: string, h: string | undefined): Promise<Response> {
-    const base = await this.base(repo, "about", h, `/${encodeURIComponent(repo)}/about/`);
+    const base = await this.base(repo, "about", h, `/${repoUrl(repo)}/about/`);
     const readme = await this.findReadme();
     if (!readme) return errorPage(base, "no readme found");
     const obj = await this.store.get(readme.oid);
@@ -1217,7 +1265,7 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
     const base = await this.base(repo, "summary");
     const branches = this.store.refs().filter((r) => r.name.startsWith("refs/heads/"));
     const tags = this.store.refs().filter((r) => r.name.startsWith("refs/tags/"));
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
 
     if (!branches.length && !tags.length) {
       return htmlResponse(
@@ -1257,8 +1305,8 @@ ${statRows || "<tr><td>(no changes)</td></tr>"}
         }
         const c = await this.peelToCommit(target);
         if (c && !when) when = c.commit.committer.time;
-        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
-          `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a>`;
+        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
+          `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/tag/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td><a href='${r}/commit/?id=${target}'>${esc(c?.commit.subject ?? "")}</a></td>` +
           `<td>${esc(c?.commit.author.name ?? "")}</td><td>${age(when)}</td><td class='snapshots'>${snap}</td></tr>`;
@@ -1293,7 +1341,7 @@ ${logRows}
   }
 
   private async logPage(repo: string, h: string | undefined, ofs: number, filter: LogFilter): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "log", h, `${r}/log/`);
     let tip = h;
     if (filter.qt === "range" && filter.q) {
@@ -1351,7 +1399,7 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
   }
 
   private async refsPage(repo: string): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
     const refs = this.store.refs();
     const branches = refs.filter((x) => x.name.startsWith("refs/heads/"));
@@ -1360,8 +1408,8 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
       .map(async (b) => {
         const name = b.name.slice(11);
         const c = await this.peelToCommit(b.target);
-        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
-          `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a>`;
+        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
+          `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/log/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td class='sha1'><a href='${r}/commit/?id=${b.target}'>${b.target.slice(0, 10)}</a></td>` +
           `<td>${esc(c?.commit.author.name ?? "")}</td><td>${c ? age(c.commit.committer.time) : ""}</td><td class='snapshots'>${snap}</td></tr>`;
@@ -1384,8 +1432,8 @@ ${rows || "<tr class='nohover'><td colspan='3'>(no matching commits)</td></tr>"}
           when = c.committer.time;
           who = c.author.name;
         }
-        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
-          `<a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a>`;
+        const snap = `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>tar.gz</a> ` +
+          `<a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a>`;
         return `<tr><td><a href='${r}/tag/?h=${encodeURIComponent(name)}'>${esc(name)}</a></td>` +
           `<td class='sha1'><a href='${r}/commit/?id=${target}'>${target.slice(0, 10)}</a></td>` +
           `<td>${esc(who)}</td><td>${age(when)}</td><td class='snapshots'>${snap}</td></tr>`;
@@ -1404,17 +1452,17 @@ ${tagRows || "<tr class='nohover'><td colspan='5'>none</td></tr>"}
 
   private pathBar(repo: string, h: string | undefined, path: string[]): string {
     const q = h ? `?h=${encodeURIComponent(h)}` : "";
-    let html = `path: <a href='/${encodeURIComponent(repo)}/tree/${q}'>root</a>`;
+    let html = `path: <a href='/${repoUrl(repo)}/tree/${q}'>root</a>`;
     let acc = "";
     for (const seg of path) {
       acc += "/" + encodeURIComponent(seg);
-      html += `/<a href='/${encodeURIComponent(repo)}/tree${acc}${q}'>${esc(seg)}</a>`;
+      html += `/<a href='/${repoUrl(repo)}/tree${acc}${q}'>${esc(seg)}</a>`;
     }
     return html;
   }
 
   private async treePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "tree", h, `${r}/tree/${path.map(encodeURIComponent).join("/")}`);
     const rr = await this.resolveRef(h);
     if (!rr) return errorPage(base, h ? `bad ref: ${h}` : "empty repository");
@@ -1463,7 +1511,7 @@ ${rows}
   ): Promise<Response> {
     const obj = await this.store.get(entry.oid);
     if (!obj) return errorPage(base, "missing blob");
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const q = h ? `?h=${encodeURIComponent(h)}` : "";
     const href = path.map(encodeURIComponent).join("/");
     const plainHref = `${r}/plain/${href}${q}`;
@@ -1484,7 +1532,7 @@ ${rows}
   }
 
   private async blamePage(repo: string, h: string | undefined, path: string[]): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "tree", h, `${r}/blame/${path.map(encodeURIComponent).join("/")}`);
     const withPath = { ...base, pathBar: this.pathBar(repo, h, path) };
     const rr = await this.resolveRef(h);
@@ -1545,7 +1593,7 @@ ${rows}
   }
 
   private async commitPage(repo: string, id: string | undefined, h: string | undefined): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "commit", h, `${r}/commit/`);
     const oid = await this.resolveCommitId(id, h);
     if (!oid) return errorPage(base, "commit not found");
@@ -1563,7 +1611,7 @@ ${rows}
 <tr><th>commit</th><td colspan='2' class='sha1'>${oid} (<a href='${r}/patch/?id=${oid}'>patch</a>)</td></tr>
 <tr><th>tree</th><td colspan='2' class='sha1'><a href='${r}/tree/?h=${oid}'>${commit.tree}</a></td></tr>
 ${commit.parents.map((p) => `<tr><th>parent</th><td colspan='2' class='sha1'><a href='?id=${p}'>${p}</a> (<a href='${r}/diff/?id=${oid}&id2=${p}'>diff</a>)</td></tr>`).join("")}
-<tr><th>download</th><td colspan='2' class='sha1'><a href='${r}/snapshot/${encodeURIComponent(repo)}-${oid.slice(0, 10)}.tar.gz'>${esc(repo)}-${oid.slice(0, 10)}.tar.gz</a> <a href='${r}/snapshot/${encodeURIComponent(repo)}-${oid.slice(0, 10)}.zip'>zip</a></td></tr>
+<tr><th>download</th><td colspan='2' class='sha1'><a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${oid.slice(0, 10)}.tar.gz'>${esc(repoBase(repo))}-${oid.slice(0, 10)}.tar.gz</a> <a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${oid.slice(0, 10)}.zip'>zip</a></td></tr>
 </table>
 <div class='commit-subject'>${esc(commit.subject)}${deco.get(oid) ?? ""}</div>
 <div class='commit-msg'>${esc(commit.message.split("\n").slice(1).join("\n").trim())}</div>
@@ -1582,7 +1630,7 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
 
   /** diff/rawdiff: changes id2..id (default id2 = first parent of id). */
   private async diffPage(repo: string, id: string | undefined, id2: string | undefined, h: string | undefined, raw: boolean): Promise<Response> {
-    const base = await this.base(repo, "diff", h, `/${encodeURIComponent(repo)}/diff/`);
+    const base = await this.base(repo, "diff", h, `/${repoUrl(repo)}/diff/`);
     const newOid = await this.resolveCommitId(id, h);
     if (!newOid) return raw ? new Response("not found\n", { status: 404 }) : errorPage(base, "commit not found");
     const commit = (await this.loadCommit(newOid))!;
@@ -1636,7 +1684,7 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
   }
 
   private async tagPage(repo: string, name: string | undefined): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "refs", undefined, `${r}/refs/`);
     if (!name) return errorPage(base, "no tag given");
     const target = this.store.getRef(`refs/tags/${name}`) ?? (await this.resolveServable(name));
@@ -1651,7 +1699,7 @@ ${this.renderDiffHtml(repo, files, truncated)}`;
 <tr><th>tag name</th><td>${esc(tag.tag || name)}</td></tr>
 ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.tz)}</td></tr><tr><th>tagged by</th><td>${esc(tag.tagger.name)} &lt;${esc(tag.tagger.email)}&gt;</td></tr>` : ""}
 <tr><th>tagged object</th><td class='sha1'><a href='${r}/commit/?id=${tag.object}'>${tag.object}</a> (${esc(tag.type)})</td></tr>
-<tr><th>download</th><td class='sha1'><a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.tar.gz'>${esc(repo)}-${esc(name)}.tar.gz</a> <a href='${r}/snapshot/${encodeURIComponent(repo)}-${encodeURIComponent(name)}.zip'>zip</a></td></tr>
+<tr><th>download</th><td class='sha1'><a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.tar.gz'>${esc(repoBase(repo))}-${esc(name)}.tar.gz</a> <a href='${r}/snapshot/${encodeURIComponent(repoBase(repo))}-${encodeURIComponent(name)}.zip'>zip</a></td></tr>
 </table>
 <div class='commit-msg'>${esc(tag.message.trim())}</div>`;
     } else {
@@ -1681,7 +1729,8 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     }
     // cgit-style: reponame-ref.tar.gz; also accept a bare ref and a v-prefix
     const candidates = [stem];
-    if (stem.startsWith(`${repo}-`)) candidates.push(stem.slice(repo.length + 1));
+    const base = repoBase(repo); // snapshot filenames carry the last name segment
+    if (stem.startsWith(`${base}-`)) candidates.push(stem.slice(base.length + 1));
     for (const c of [...candidates]) candidates.push(`v${c}`);
     let commit: { oid: string; commit: Commit } | null = null;
     for (const cand of candidates) {
@@ -1727,7 +1776,7 @@ ${tag.tagger ? `<tr><th>tag date</th><td>${fmtDate(tag.tagger.time, tag.tagger.t
     const rr = await this.resolveRef(h);
     if (!rr) return new Response("empty repository\n", { status: 404 });
     const { entries } = await this.walkLog(rr.oid, 0, 20);
-    const abs = `${proto}://${host}/${encodeURIComponent(repo)}`;
+    const abs = `${proto}://${host}/${repoUrl(repo)}`;
     const iso = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
     const updated = entries[0] ? iso(entries[0].commit.committer.time) : iso(0);
     const items = entries
@@ -1806,7 +1855,7 @@ ${items}
   }
 
   private async statsPage(repo: string, h: string | undefined, period: string): Promise<Response> {
-    const r = `/${encodeURIComponent(repo)}`;
+    const r = `/${repoUrl(repo)}`;
     const base = await this.base(repo, "stats", h, `${r}/stats/`);
     const rr = await this.resolveRef(h);
     if (!rr) return errorPage(base, "empty repository");

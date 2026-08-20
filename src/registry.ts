@@ -81,8 +81,20 @@ export class Registry extends DurableObject<Env> {
     return rows[0] ?? null;
   }
 
-  /** Public index page feed: excludes private repos, bounded so a large table can't dump wholesale over RPC. */
-  list(limit = 1000): RepoInfo[] {
+  /** Public index page feed: excludes private repos, bounded so a large table
+   * can't dump wholesale over RPC. `ns` filters to one namespace ("ns/..."),
+   * as a range scan: '0' is the code point after '/'. */
+  list(limit = 1000, ns?: string): RepoInfo[] {
+    if (ns) {
+      return this.ctx.storage.sql
+        .exec<RepoInfo>(
+          "SELECT name, desc, owner, section, priv, idle, ver FROM repos WHERE priv = 0 AND name >= ? AND name < ? ORDER BY idle DESC LIMIT ?",
+          `${ns}/`,
+          `${ns}0`,
+          limit
+        )
+        .toArray();
+    }
     return this.ctx.storage.sql
       .exec<RepoInfo>(
         "SELECT name, desc, owner, section, priv, idle, ver FROM repos WHERE priv = 0 ORDER BY idle DESC LIMIT ?",

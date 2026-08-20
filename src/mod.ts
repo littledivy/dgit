@@ -9,7 +9,7 @@
  */
 import type { Env } from "./env";
 import type { RepoInfo } from "./registry";
-import { esc, age, layout, htmlResponse, errorPage } from "./ui/html";
+import { esc, repoUrl, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
 import { parseUploadRequest, streamingCloneResponse } from "./git/protocol";
 import { isOid } from "./git/util";
@@ -20,14 +20,14 @@ export { RepoCell } from "./repo";
 export { Registry } from "./registry";
 export type { Env } from "./env";
 export type { RepoInfo, RepoConfig } from "./registry";
-export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, LogResult } from "./repo";
+export type { RefsResult, CommitJson, TreeResult, TreeEntryJson, BlobResult, LogResult, DiffResult, DiffFileJson } from "./repo";
 export type { Person } from "./git/objects";
 
 /** an upload-pack negotiation body is wants/haves/caps only — a few hundred KB */
 const MAX_UPLOAD_PACK_BYTES = 16 * 1024 * 1024;
 
 const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const RESERVED = new Set(["cgit.css", "favicon.ico", "robots.txt", "info", "git-upload-pack", "git-receive-pack"]);
+const RESERVED = new Set(["api", "cgit.css", "favicon.ico", "robots.txt", "info", "git-upload-pack", "git-receive-pack"]);
 const CACHE_TTL = 60;
 
 /** What a request is asking to do, from the repository's point of view. */
@@ -78,6 +78,24 @@ export interface DurableGitOptions<E extends Env = Env> {
    * (via waitUntil), so a slow or throwing hook never fails the push.
    */
   onPush?: (event: PushEvent, env: E) => void | Promise<void>;
+  /**
+   * false runs dgit headless: the git protocol, admin endpoints, and the JSON
+   * API stay; every page (index and repo UI) 404s, so a wrapping Worker can
+   * own the whole frontend. Default true.
+   */
+  ui?: boolean;
+  /**
+   * access-control-allow-origin for the JSON API (e.g. "*"), so a
+   * cross-origin UI can call it from the browser; preflights are answered.
+   */
+  cors?: string;
+  /**
+   * true routes every repository as <owner>/<name> (GitHub-style, exactly two
+   * segments); the combined name is the repository name everywhere — hooks,
+   * the registry, the API, RPC (env.REPO.getByName("owner/name")). Default
+   * false: flat single-segment names.
+   */
+  namespaces?: boolean;
 }
 
 function tokens(env: Env): string[] {
@@ -220,7 +238,7 @@ async function indexPage(env: Env): Promise<Response> {
   let rows = "";
   for (const r of repos) {
     rows +=
-      `<tr><td><a href='/${encodeURIComponent(r.name)}/'>${esc(r.name)}</a></td>` +
+      `<tr><td><a href='/${repoUrl(r.name)}/'>${esc(r.name)}</a></td>` +
       `<td>${esc(r.desc || "[no description]")}</td>` +
       `<td>${esc(r.owner || env.SITE_OWNER || "")}</td>` +
       `<td>${age(Math.floor(r.idle / 1000))}</td></tr>`;
@@ -323,6 +341,23 @@ async function serveCloneFromR2(
   return streamingCloneResponse(obj.body, objects, req.caps.has("no-progress"));
 }
 
+function withCors(res: Response, origin: string | undefined): Response {
+  if (origin) res.headers.set("access-control-allow-origin", origin);
+  return res;
+}
+
+function corsPreflight(origin: string): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": origin,
+      "access-control-allow-methods": "GET",
+      "access-control-allow-headers": "authorization",
+      "access-control-max-age": "86400",
+    },
+  });
+}
+
 function parseRefUpdates(res: Response): RefUpdate[] {
   const header = res.headers.get("x-ref-updates");
   if (!header) return [];
@@ -340,12 +375,85 @@ export interface DurableGitHandler<E extends Env = Env> {
   fetch(req: Request, env: E, ctx: ExecutionContext): Promise<Response>;
 }
 
+/**
+ * Parse a repository route: /<name>[.git][/sub] flat, /<owner>/<name>[.git][/sub]
+ * namespaced. null for anything that is not a well-formed repository path
+ * (bad or reserved names, undecodable escapes).
+ */
+function repoPath(
+  pattern: URLPattern,
+  namespaced: boolean,
+  path: string
+): { repo: string; sub: string } | null {
+  const m = pattern.exec({ pathname: path });
+  if (!m) return null;
+  const g = m.pathname.groups;
+  const segs: string[] = [];
+  for (const raw of namespaced ? [g.owner, g.name] : [g.name]) {
+    if (!raw) return null;
+    let seg: string;
+    try {
+      seg = decodeURIComponent(raw);
+    } catch {
+      return null;
+    }
+    if (!REPO_NAME.test(seg)) return null;
+    segs.push(seg);
+  }
+  if (RESERVED.has(segs[0])) return null;
+  return { repo: segs.join("/"), sub: g["0"] ? `/${g["0"]}` : "/" };
+}
+
+/** What a repository sub-path is asking for, and the authorize op it implies. */
+function classify(sub: string, method: string, url: URL): {
+  op: AuthOp;
+  isReceive: boolean;
+  isProtocol: boolean;
+  isApi: boolean;
+  isAdmin: boolean;
+} {
+  const isReceive =
+    sub === "/git-receive-pack" ||
+    (sub === "/info/refs" && url.searchParams.get("service") === "git-receive-pack");
+  const isProtocol = isReceive || sub === "/git-upload-pack" || sub === "/info/refs";
+  const isApi = sub.startsWith("/api/");
+  const isAdmin =
+    ((sub === "/config" || sub === "/description") && method === "PUT") ||
+    (sub === "/gc" && method === "POST") ||
+    ((sub === "/" || sub === "") && method === "DELETE");
+  return { op: isReceive ? "write" : isAdmin ? "admin" : "read", isReceive, isProtocol, isApi, isAdmin };
+}
+
 export function createDurableGit<E extends Env = Env>(options: DurableGitOptions<E> = {}): DurableGitHandler<E> {
   const authorize = options.authorize ?? tokenAuthorize;
+  const ui = options.ui !== false;
+  const namespaced = !!options.namespaces;
+  const repoRoute = new URLPattern({
+    pathname: namespaced ? "/:owner/:name{.git}?{/*}?" : "/:name{.git}?{/*}?",
+  });
   return {
     async fetch(req: Request, env: E, ctx: ExecutionContext): Promise<Response> {
       const url = new URL(req.url);
       const path = url.pathname;
+
+      // site-level JSON ("api" is a reserved repository name)
+      if (path.startsWith("/api/")) {
+        if (options.cors && req.method === "OPTIONS") return corsPreflight(options.cors);
+        const json = (data: unknown, status = 200) =>
+          withCors(Response.json(data, { status, headers: { "x-content-type-options": "nosniff" } }), options.cors);
+        if (path === "/api/repos" && req.method === "GET") {
+          const ns = url.searchParams.get("owner") ?? undefined;
+          const repos = await env.REGISTRY.getByName("registry").list(1000, ns);
+          return json({
+            repos: repos.map((r) => ({ name: r.name, description: r.desc, owner: r.owner, section: r.section, idle: r.idle })),
+          });
+        }
+        return json({ error: "not found" }, 404);
+      }
+
+      if (!ui && (path === "/" || path === "" || path === "/cgit.css" || path === "/robots.txt" || path === "/favicon.ico")) {
+        return new Response("not found\n", { status: 404 });
+      }
 
       if (path === "/" || path === "") {
         // the index is the front door under load: cache it briefly at the edge
@@ -375,32 +483,31 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
         return new Response("not found\n", { status: 404 });
       }
 
-      const m = path.match(/^\/([^/]+?)(\.git)?(\/.*)?$/);
-      if (!m) return errorPage(siteBase(env), "bad request", 400);
-      const repo = decodeURIComponent(m[1]);
-      const sub = m[3] ?? "/";
-      if (!REPO_NAME.test(repo) || RESERVED.has(repo)) {
-        return errorPage(siteBase(env), `no such repository: ${repo}`, 404);
+      const parsed = repoPath(repoRoute, namespaced, path);
+      if (!parsed) {
+        return ui
+          ? errorPage(siteBase(env), `no such repository: ${path}`, 404)
+          : new Response("not found\n", { status: 404 });
       }
+      const { repo, sub } = parsed;
+      const { op, isReceive, isProtocol, isApi, isAdmin } = classify(sub, req.method, url);
 
       const registry = env.REGISTRY.getByName("registry");
 
-      const isReceive =
-        sub === "/git-receive-pack" ||
-        (sub === "/info/refs" && url.searchParams.get("service") === "git-receive-pack");
-      const isProtocol = isReceive || sub === "/git-upload-pack" || sub === "/info/refs";
-      const isApi = sub.startsWith("/api/");
-      const isAdmin =
-        ((sub === "/config" || sub === "/description") && req.method === "PUT") ||
-        (sub === "/gc" && req.method === "POST") ||
-        ((sub === "/" || sub === "") && req.method === "DELETE");
+      // headless: pages 404 before touching the registry or the cell; a CORS
+      // preflight (credential-less by spec) is answered before the auth gate
+      if (!ui && !isProtocol && !isApi && !isAdmin) {
+        return new Response("not found\n", { status: 404 });
+      }
+      if (options.cors && isApi && req.method === "OPTIONS") {
+        return corsPreflight(options.cors);
+      }
 
       // mutations read the registry fresh; page views tolerate a short memo
       const info: RepoInfo | null = await repoInfo(env, repo, isReceive || isAdmin);
 
       // every repo-scoped request passes through authorize; the default hook
       // waves reads of public repositories straight through
-      const op: AuthOp = isReceive ? "write" : isAdmin ? "admin" : "read";
       const decision = await authorize({
         repo,
         op,
@@ -478,7 +585,12 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       fwd.headers.set("x-repo", repo);
       fwd.headers.set("x-host", url.host);
       fwd.headers.set("x-proto", url.protocol.replace(":", ""));
-      const res = await stub.fetch(fwd);
+      let res = await stub.fetch(fwd);
+      // set before the cache put, so cached copies carry the header too
+      if (options.cors && isApi) {
+        res = new Response(res.body, res);
+        res.headers.set("access-control-allow-origin", options.cors);
+      }
 
       // bookkeeping after successful mutations. idle is the newest committer date
       // (x-commit-time), computed by the DO which alone can read the object graph
