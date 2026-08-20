@@ -434,4 +434,53 @@ div#cgit table.list td.snapshots a {
 div#cgit form select, div#cgit form input {
   font-size: 90%;
 }
+/* small screens: keep the cgit look but shrink the chrome, let the tabs
+   wrap, and scroll wide tables inside their own box instead of the page */
+@media (max-width: 700px) {
+  div#cgit table#header td.main {
+    font-size: 150%;
+    white-space: normal;
+    padding-left: 4px;
+  }
+  div#cgit table#header td.sub {
+    padding-left: 4px;
+  }
+  div#cgit table.tabs, div#cgit table.tabs tr, div#cgit table.tabs td {
+    display: block;
+  }
+  div#cgit table.tabs {
+    margin-top: 1em;
+  }
+  div#cgit table.tabs td {
+    padding: 0 0.25em;
+  }
+  div#cgit table.tabs td a {
+    display: inline-block;
+    padding: 3px 0.6em;
+  }
+  div#cgit table.tabs td.form {
+    text-align: left;
+    padding: 3px 0.6em;
+  }
+  div#cgit div.path {
+    padding: 5px 0.75em 2px 0.75em;
+  }
+  div#cgit div.content {
+    padding: 1em 0.75em;
+  }
+  div#cgit table.list, div#cgit table.blob, div#cgit table.blame,
+  div#cgit table.commit-info, div#cgit table.stats {
+    display: block;
+    overflow-x: auto;
+  }
+  div#cgit div.commit-msg {
+    overflow-x: auto;
+  }
+  div#cgit td.ls-mode, div#cgit td.ls-size {
+    width: auto;
+  }
+  div#cgit form input[type='text'] {
+    width: 8em;
+  }
+}
 `;
