@@ -482,8 +482,9 @@ export class PackStore {
     opts: {
       maxBytes: number;
       /** push body size (content-length ~= pack size); packs this size are
-       * stored in R2 when a bucket is bound, else in SQLite. Absent/unknown
-       * (chunked pushes) picks SQLite — the small-push-fast bias. */
+       * stored in R2 when a bucket is bound, else in SQLite. Absent means the
+       * client went chunked, which git only does above ~1MB (http.postBuffer)
+       * — so unknown size picks R2, the safe side for the 10GB SQLite cap. */
       sizeHint?: number;
       cache: ObjCache;
       onProgress?: (msg: string) => void;
@@ -534,14 +535,14 @@ export class PackStore {
       console.log(`[ingest pack ${packId} +${Math.round((Date.now() - started) / 1000)}s] ${msg.trim()}`);
     };
 
-    // storage backend: a large pack (sizeHint >= R2_PACK_MIN_BYTES) with an R2
-    // binding streams its bytes to raw/<repo>/<packId> via multipart and only the
-    // index stays in SQLite; small packs (and any push without the binding or with
-    // unknown length) go to pack_data as before. Prime the backend cache now — before
+    // storage backend: with an R2 binding, a large (sizeHint >= R2_PACK_MIN_BYTES)
+    // or unknown-length (chunked, so >1MB) pack streams its bytes to
+    // raw/<repo>/<packId> via multipart and only the index stays in SQLite; small
+    // declared-length packs go to pack_data. Prime the backend cache now — before
     // pack_meta exists — so phase B/C readRaw hits the right source. A refused
     // multipart begin (celld makes createMultipartUpload throw) degrades to SQLite.
     let capture: MultipartCapture | null = null;
-    const wantR2 = this.r2 !== null && opts.sizeHint !== undefined && opts.sizeHint >= R2_PACK_MIN_BYTES;
+    const wantR2 = this.r2 !== null && (opts.sizeHint === undefined || opts.sizeHint >= R2_PACK_MIN_BYTES);
     if (this.r2 && wantR2) {
       const mp = await beginRawMultipart(this.r2.bucket, this.rawKey(packId));
       if (mp) capture = new MultipartCapture(mp);

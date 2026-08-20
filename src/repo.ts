@@ -768,7 +768,7 @@ export class RepoCell extends DurableObject<Env> {
         // real Workers the whole isolate has a hard 128MB, so stay small there
         const budget = typeof caches !== "undefined" ? 16 * 1024 * 1024 : 512 * 1024 * 1024;
         // content-length ~= pack size; it selects the R2-vs-SQLite backend before
-        // the first byte lands. Absent/unknown (chunked) leaves it undefined → SQLite.
+        // the first byte lands. Absent (chunked, i.e. a >1MB push) → undefined → R2.
         const declared = parseInt(req.headers.get("content-length") ?? "", 10);
         await this.store.packs.ingest(firstPackBytes, reader, {
           maxBytes,
