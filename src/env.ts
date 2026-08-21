@@ -12,6 +12,11 @@ export interface Env {
   GIT_TOKENS?: string;
   /** max accepted push size in MB (default 512) */
   MAX_PUSH_MB?: string;
+  /** in-memory ingest cache budget in MB, holding decompressed objects for
+   * delta-base resolution during a push. Misses reload from SQLite, so a
+   * smaller budget trades ingest speed for peak memory. Default: 16 on real
+   * Workers (hard 128MB isolate), 64 on celld (multi-GB heap). */
+  INGEST_CACHE_MB?: string;
   /** "1" screens every pushed object with SHA-1DC collision detection; default
    * hashes with native crypto.subtle (identical oid, far faster) */
   SHA1DC?: string;

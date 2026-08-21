@@ -4,6 +4,20 @@ import { ObjType } from "./objects";
 import { OidSet } from "./oidset";
 import { PackStore, ObjCache, ObjRec } from "./packstore";
 
+/** A reachable pack entry, streamed in storage order by `reachablePackedAfter`.
+ *  The `size` field of a full PackedEntry is not needed to emit the pack, so it
+ *  is left unselected. */
+export interface PackedReachable {
+  oid: string;
+  packId: number;
+  offset: number;
+  dataOff: number;
+  dataLen: number;
+  type: ObjType;
+  entrySize: number;
+  baseOid: string | null;
+}
+
 const CHUNK = 1024 * 1024; // stay well under the DO SQLite per-row limit
 // serving cache: Workers isolates have a hard 128MB total, so stay modest
 // there; self-hosted celld nodes run with multi-GB heaps
@@ -61,6 +75,9 @@ export class GitStore {
         period TEXT NOT NULL,
         data TEXT NOT NULL,
         PRIMARY KEY (tip_oid, period)
+      );
+      CREATE TABLE IF NOT EXISTS push_edges (
+        child TEXT NOT NULL
       );
     `);
     const flag = this.getMeta("has-loose");
@@ -134,6 +151,57 @@ export class GitStore {
 
   objectCount(): number {
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM objects").one().n + this.packs.countObjects();
+  }
+
+  // --- push connectivity ---------------------------------------------------
+  // Connectivity of a fresh push is checked in SQL, not by an in-memory graph
+  // walk: the pushed pack must be complete, i.e. every object it introduces
+  // must have its referenced children in `pack_objects` ∪ `objects`. Children
+  // are staged into `push_edges` in bounded batches and each batch is
+  // anti-joined against the stores, so the check costs O(batch) rows of scratch
+  // rather than an OidSet that scales with the object count.
+
+  /** A page of a pack's non-blob oids after `after` (keyset, so the scan holds
+   * one page, never the whole pack). Empty array ends the walk. */
+  packNonBlobOidsAfter(packId: number, after: string, limit: number): string[] {
+    return this.sql
+      .exec<{ oid: string }>(
+        "SELECT oid FROM pack_objects WHERE pack_id = ? AND type != 'blob' AND oid > ? ORDER BY oid LIMIT ?",
+        packId,
+        after,
+        limit,
+      )
+      .toArray()
+      .map((r) => r.oid);
+  }
+
+  resetPushEdges(): void {
+    this.sql.exec("DELETE FROM push_edges");
+  }
+
+  /** Stage referenced child oids, chunked under the DO's ~100 bound-variable
+   * statement cap. */
+  addPushEdges(children: string[]): void {
+    for (let i = 0; i < children.length; i += 64) {
+      const batch = children.slice(i, i + 64);
+      const values = batch.map(() => "(?)").join(",");
+      this.sql.exec(`INSERT INTO push_edges (child) VALUES ${values}`, ...batch);
+    }
+  }
+
+  /** The first staged child absent from both stores, or null when every staged
+   * child is present. SQLite runs the membership test over its own indexes, so
+   * no oid set is built in the isolate. */
+  firstMissingPushEdge(): string | null {
+    const rows = this.sql
+      .exec<{ child: string }>(
+        `SELECT e.child FROM push_edges e
+         WHERE NOT EXISTS (SELECT 1 FROM pack_objects p WHERE p.oid = e.child)
+           AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.oid = e.child)
+         LIMIT 1`,
+      )
+      .toArray();
+    return rows.length ? rows[0].child : null;
   }
 
   /** Resolve an abbreviated oid; null if unknown or ambiguous. */
@@ -335,5 +403,87 @@ export class GitStore {
   /** Drop the version stamp so the next full clone rebuilds the set by walking. */
   invalidateReachable(): void {
     this.setMeta("reachable-version", "");
+  }
+
+  /**
+   * True when the persisted reachable set still matches the current refs, so a
+   * full clone can stream its objects straight from storage (see
+   * `reachablePackedAfter`) instead of loading the whole set into an OidSet and
+   * walking. The version check is the same correctness gate `loadReachable`
+   * uses — a stale set is never streamed.
+   */
+  reachableCacheValid(): boolean {
+    return this.getMeta("reachable-version") === this.reachableVersion();
+  }
+
+  /** Size of the cached reachable set — the exact object count a warm full
+   *  clone declares in its pack header. */
+  reachableCount(): number {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM reachable").one().n;
+  }
+
+  /** Whether `oid` is in the cached reachable set. On the warm full-clone path a
+   *  stored delta ships as a ref-delta only when its base is also being sent,
+   *  i.e. also reachable; otherwise that object is inflated whole. */
+  reachableHas(oid: string): boolean {
+    return this.sql.exec("SELECT 1 FROM reachable WHERE oid = ? LIMIT 1", oid).toArray().length > 0;
+  }
+
+  /**
+   * Reachable objects that live in a pack, one keyset page at a time in
+   * (pack_id, offset) storage order. Marching each pack sequentially keeps the
+   * raw-chunk cache hitting, and the (pack_id, offset) cursor holds no
+   * per-object state in the isolate — so a warm full clone streams in O(page)
+   * memory no matter how many objects the repo has, replacing the OidSet and
+   * parallel typed arrays the walk path builds.
+   */
+  reachablePackedAfter(afterPack: number, afterOffset: number, limit: number): PackedReachable[] {
+    return this.sql
+      .exec<{
+        oid: string;
+        pack_id: number;
+        offset: number;
+        data_off: number;
+        data_len: number;
+        type: ObjType;
+        entry_size: number;
+        base_oid: string | null;
+      }>(
+        `SELECT p.oid, p.pack_id, p.offset, p.data_off, p.data_len, p.type, p.entry_size, p.base_oid
+           FROM reachable r JOIN pack_objects p ON p.oid = r.oid
+          WHERE p.pack_id > ? OR (p.pack_id = ? AND p.offset > ?)
+          ORDER BY p.pack_id, p.offset
+          LIMIT ?`,
+        afterPack,
+        afterPack,
+        afterOffset,
+        limit,
+      )
+      .toArray()
+      .map((r) => ({
+        oid: r.oid,
+        packId: r.pack_id,
+        offset: r.offset,
+        dataOff: r.data_off,
+        dataLen: r.data_len,
+        type: r.type,
+        entrySize: r.entry_size,
+        baseOid: r.base_oid,
+      }));
+  }
+
+  /** Reachable objects with no pack entry (loose), ordered by oid — streamed
+   *  after every packed object so a warm full clone has a stable total order. */
+  reachableLooseAfter(afterOid: string, limit: number): string[] {
+    return this.sql
+      .exec<{ oid: string }>(
+        `SELECT r.oid FROM reachable r
+          WHERE NOT EXISTS (SELECT 1 FROM pack_objects p WHERE p.oid = r.oid) AND r.oid > ?
+          ORDER BY r.oid LIMIT ?`,
+        afterOid,
+        limit,
+      )
+      .toArray()
+      .map((r) => r.oid);
   }
 }

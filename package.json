@@ -1,6 +1,6 @@
 {
   "name": "durable-git",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Durable git: a git server as a Cloudflare Durable Object. Smart HTTP, a cgit-style web interface, pluggable auth, push events, and a typed content API.",
   "type": "module",
   "main": "src/mod.ts",

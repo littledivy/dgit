@@ -4,7 +4,7 @@ import { GitStore } from "./store";
 import { PackWriter } from "./pack";
 import { OidSet } from "./oidset";
 import { MultipartCapture, MultipartPackUpload } from "./multipart";
-import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE } from "./objects";
+import { parseCommit, parseTag, parseTree, isGitlinkMode, isTreeMode, TYPE_NUM, NUM_TYPE, ObjType } from "./objects";
 
 const AGENT = "agent=dgit/0.3";
 const INFINITE_DEPTH = 0x7fffffff;
@@ -482,12 +482,16 @@ async function collectPackOids(
   descendThroughExcluded: boolean,
   expected: number
 ): Promise<OidSet> {
+  // The frontier is the visited set itself, walked in insertion order by a
+  // cursor: a child is appended with addHex (deduped in place) and reached
+  // when the cursor gets to it, so there is no separate stack of hex oids to
+  // hold alongside the OidSet. The result set is decided by membership, so
+  // this BFS and the old DFS produce the identical walk and marked sub-set.
   const walk = new OidSet(expected);
-  const stack = [...wants];
+  for (const w of wants) walk.addHex(w);
   let ops = 0;
-  while (stack.length) {
-    const oid = stack.pop()!;
-    if (!walk.addHex(oid)) continue;
+  for (let i = 0; i < walk.size; i++) {
+    const oid = walk.atHex(i);
     if (++ops % WALK_YIELD === 0) await new Promise((r) => setTimeout(r, 0));
     const meta = store.typeAndSize(oid);
     if (!meta) throw new Error(`missing object ${oid}`);
@@ -495,24 +499,13 @@ async function collectPackOids(
     if (excluded.hasHex(oid)) {
       if (descendThroughExcluded && meta.type === "commit") {
         const full = (await store.get(oid))!;
-        stack.push(...parseCommit(full.data).parents);
+        for (const p of parseCommit(full.data).parents) walk.addHex(p);
       }
       continue;
     }
     walk.markHex(oid);
     if (meta.type === "blob") continue; // leaf: membership only
-    const full = (await store.get(oid))!;
-    if (full.type === "commit") {
-      const c = parseCommit(full.data);
-      stack.push(c.tree, ...c.parents);
-    } else if (full.type === "tag") {
-      const t = parseTag(full.data);
-      if (t.object) stack.push(t.object);
-    } else if (full.type === "tree") {
-      for (const e of parseTree(full.data)) {
-        if (!isGitlinkMode(e.mode)) stack.push(e.oid);
-      }
-    }
+    for (const child of childOids((await store.get(oid))!)) walk.addHex(child);
   }
   return walk;
 }
@@ -649,6 +642,24 @@ export async function uploadPack(
   // `capture` below). Absent R2 (celld / no binding) this is a plain DO clone.
   const r2Key =
     fullClone && sideband && packCache ? `pack/${packCache.repo}/${store.reachableVersion()}` : null;
+
+  // Warm full-clone fast path: the reachable set is persisted and current, so
+  // stream the pack straight out of storage in (pack_id, offset) order without
+  // ever loading the object set into the isolate. This is the O(1)-memory clone
+  // — no OidSet, no parallel typed arrays — bounded by one keyset page instead
+  // of the object count. A cold or stale cache falls through to the walk below,
+  // which rebuilds and persists the set (one in-RAM walk, then warm forever).
+  if (fullClone && store.reachableCacheValid()) {
+    return warmFullClone(store, {
+      preamble,
+      sideband,
+      noProgress,
+      r2Key,
+      packCache,
+      release,
+      headers,
+    });
+  }
 
   let send = fullClone ? store.loadReachable() : null;
   if (!send) {
@@ -879,6 +890,167 @@ export async function uploadPack(
   return new Response(stream, { headers });
 }
 
+/**
+ * Stream a full clone straight from the persisted reachable set, holding no
+ * object set in the isolate. The reachable cache is current (the caller checked
+ * `reachableCacheValid`), so the objects to send are exactly its rows: emit the
+ * packed ones in (pack_id, offset) storage order a keyset page at a time, then
+ * the loose ones by oid. Peak memory is one page plus one object, independent
+ * of repo size — the walk path's OidSet and parallel typed arrays are gone.
+ *
+ * Emission is byte-identical to the walk path: a stored delta ships as a
+ * ref-delta when its base is also reachable (so also sent), else it is inflated
+ * whole; index-pack resolves ref-deltas by oid in any order. `total` is the
+ * reachable count, declared in the header; if the set drifts mid-stream (a push
+ * landing during the clone) the count guard aborts rather than ship a pack that
+ * disagrees with its header — the client simply retries.
+ */
+async function warmFullClone(
+  store: GitStore,
+  opts: {
+    preamble: Uint8Array[];
+    sideband: boolean;
+    noProgress: boolean;
+    r2Key: string | null;
+    packCache: PackCache | undefined;
+    release: () => void;
+    headers: Record<string, string>;
+  },
+): Promise<Response> {
+  const { preamble, sideband, noProgress, r2Key, packCache, release, headers } = opts;
+  const total = store.reachableCount();
+  const PAGE = 1000;
+
+  // One emit-thunk per object, in storage order: every packed reachable object
+  // (marching packs sequentially), then every loose reachable object by oid.
+  async function* objects(): AsyncGenerator<(w: PackWriter) => Promise<void>> {
+    let curPack = 0;
+    let curOff = -1;
+    for (;;) {
+      const rows = store.reachablePackedAfter(curPack, curOff, PAGE);
+      for (const e of rows) {
+        curPack = e.packId;
+        curOff = e.offset;
+        if (e.baseOid !== null && store.reachableHas(e.baseOid)) {
+          const base = e.baseOid;
+          yield async (w) =>
+            w.rawDelta(e.entrySize, base, await store.packs.readRaw(e.packId, e.dataOff, e.dataLen));
+        } else if (e.baseOid !== null) {
+          // base is not itself being sent: it cannot be a ref-delta, inflate it
+          yield async (w) => {
+            const obj = await store.get(e.oid);
+            if (!obj) throw new Error(`missing object ${e.oid}`);
+            w.object(obj.type, obj.data);
+          };
+        } else {
+          yield async (w) =>
+            w.rawFull(e.type, e.entrySize, await store.packs.readRaw(e.packId, e.dataOff, e.dataLen));
+        }
+      }
+      if (rows.length < PAGE) break;
+    }
+    let afterOid = "";
+    for (;;) {
+      const loose = store.reachableLooseAfter(afterOid, PAGE);
+      for (const oid of loose) {
+        afterOid = oid;
+        yield async (w) => {
+          const obj = await store.get(oid);
+          if (!obj) throw new Error(`missing object ${oid}`);
+          w.object(obj.type, obj.data);
+        };
+      }
+      if (loose.length < PAGE) break;
+    }
+  }
+  const it = objects();
+
+  const pending: Uint8Array[] = [concat(preamble)];
+  let buffered: Uint8Array[] = [];
+  let bufferedLen = 0;
+  const flushBuffered = () => {
+    if (!bufferedLen) return;
+    const payload = concat(buffered);
+    buffered = [];
+    bufferedLen = 0;
+    if (sideband) pending.push(...sidebandFrames(1, payload));
+    else pending.push(payload);
+  };
+  let capture: MultipartCapture | null = null;
+  if (r2Key && packCache) {
+    const mp = await packCache.beginMultipart(r2Key, total);
+    if (mp) capture = new MultipartCapture(mp);
+  }
+  const writer = new PackWriter((chunk) => {
+    if (capture) capture.push(chunk);
+    buffered.push(chunk);
+    bufferedLen += chunk.length;
+    if (bufferedLen >= SIDEBAND_CHUNK) flushBuffered();
+  });
+
+  let emitted = 0;
+  let finished = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start: (ctrl) => {
+      if (sideband && !noProgress) {
+        pending.push(...sidebandFrames(2, te.encode(`Enumerating objects: ${total}, done.\n`)));
+      }
+      writer.header(total);
+      for (const c of pending) ctrl.enqueue(c);
+      pending.length = 0;
+    },
+    pull: async (ctrl) => {
+      try {
+        let drained = false;
+        for (let n = 0; n < 64; n++) {
+          const next = await it.next();
+          if (next.done) {
+            drained = true;
+            break;
+          }
+          await next.value(writer);
+          emitted++;
+        }
+        if (drained && !finished) {
+          // A count check, not a full set-consistency check: it catches a push
+          // that grew or shrank the reachable set mid-stream (the pack would
+          // disagree with its declared header), so the client retries rather
+          // than resolve a malformed pack. The cold path snapshots the set into
+          // an OidSet and has no such window; this is the warm path's tradeoff.
+          if (emitted !== total) {
+            throw new Error(`reachable set drifted mid-clone: emitted ${emitted}, declared ${total}`);
+          }
+          finished = true;
+          writer.finish();
+          flushBuffered();
+          if (sideband) pending.push(FLUSH);
+        } else {
+          flushBuffered();
+        }
+        for (const c of pending) ctrl.enqueue(c);
+        pending.length = 0;
+        if (capture) {
+          if (finished) await capture.finish();
+          else await capture.drain();
+        }
+        if (finished) {
+          ctrl.close();
+          release();
+        }
+      } catch (err) {
+        if (capture) await capture.abort();
+        release();
+        ctrl.error(err);
+      }
+    },
+    cancel: async () => {
+      if (capture) await capture.abort();
+      release();
+    },
+  });
+  return new Response(stream, { headers });
+}
+
 /** Is `anc` an ancestor of (or equal to) `desc`? Bounded walk. */
 export async function isAncestor(store: GitStore, anc: string, desc: string): Promise<boolean> {
   if (anc === desc) return true;
@@ -944,26 +1116,20 @@ const BAD_REF = /[\s~^:?*\[\\'"<>&`\x00-\x1f\x7f]/;
  * touches only objects this push introduced.
  */
 async function reachableComplete(store: GitStore, tip: string, known: OidSet): Promise<boolean> {
-  const stack = [tip];
-  while (stack.length) {
-    const oid = stack.pop()!;
-    if (!known.addHex(oid)) continue;
+  // Cursor BFS over `known` itself: newly reached oids append past `start`,
+  // and pre-existing entries (a fast-forward's already-validated closure) sit
+  // before it and are never re-walked. Reusing the set as its own frontier
+  // needs no separate hex-oid stack to walk it.
+  const start = known.size;
+  if (!known.addHex(tip)) return true; // tip already in a validated closure
+  for (let i = start; i < known.size; i++) {
+    const oid = known.atHex(i);
     const meta = store.typeAndSize(oid);
     if (!meta) return false;
     if (meta.type === "blob") continue;
     const obj = await store.get(oid);
     if (!obj) return false;
-    if (obj.type === "commit") {
-      const c = parseCommit(obj.data);
-      stack.push(c.tree, ...c.parents);
-    } else if (obj.type === "tag") {
-      const t = parseTag(obj.data);
-      if (t.object) stack.push(t.object);
-    } else if (obj.type === "tree") {
-      for (const e of parseTree(obj.data)) {
-        if (!isGitlinkMode(e.mode)) stack.push(e.oid);
-      }
-    }
+    for (const child of childOids(obj)) known.addHex(child);
   }
   return true;
 }
@@ -995,15 +1161,85 @@ export interface PushPlan {
  * (receiveChain) and only pushes write refs, so ref state read here is stable
  * through to commit; commitPush re-checks each CAS atomically regardless.
  */
+/** The child oids a non-blob object references (blobs are leaves). */
+function childOids(obj: { type: ObjType; data: Uint8Array }): string[] {
+  if (obj.type === "commit") {
+    const c = parseCommit(obj.data);
+    return [c.tree, ...c.parents];
+  }
+  if (obj.type === "tag") {
+    const t = parseTag(obj.data);
+    return t.object ? [t.object] : [];
+  }
+  if (obj.type === "tree") {
+    const out: string[] = [];
+    for (const e of parseTree(obj.data)) if (!isGitlinkMode(e.mode)) out.push(e.oid);
+    return out;
+  }
+  return [];
+}
+
+/**
+ * Verify a freshly ingested pack is connectivity-complete — every child oid its
+ * objects reference is present in `pack_objects` ∪ `objects` — and return the
+ * first missing child, or null when complete. This is the storage-backed
+ * counterpart to walking the graph: it scans the pack's non-blob objects one
+ * keyset page at a time, stages their referenced children into `push_edges` in
+ * bounded batches, and lets SQLite anti-join each batch against the stores. A
+ * complete pack means every tip in it has a complete closure (by induction over
+ * the edges), so the whole push is connected — checked in flat memory, with no
+ * OidSet that scales with the object count. Used for a fresh push, where the
+ * old walk built a reachable set the commit step then discarded anyway.
+ */
+async function packComplete(store: GitStore, packId: number): Promise<string | null> {
+  const PAGE = 1000;
+  const EDGE_BATCH = 8192;
+  store.resetPushEdges();
+  let after = "";
+  let pending: string[] = [];
+  const flush = (): string | null => {
+    if (!pending.length) return null;
+    store.addPushEdges(pending);
+    pending = [];
+    const miss = store.firstMissingPushEdge();
+    store.resetPushEdges();
+    return miss;
+  };
+  for (;;) {
+    const page = store.packNonBlobOidsAfter(packId, after, PAGE);
+    if (!page.length) break;
+    for (const oid of page) {
+      const obj = await store.get(oid);
+      if (!obj) return oid; // indexed but unreadable — the pack is not complete
+      for (const child of childOids(obj)) pending.push(child);
+      if (pending.length >= EDGE_BATCH) {
+        const miss = flush();
+        if (miss) return miss;
+      }
+    }
+    after = page[page.length - 1];
+  }
+  return flush();
+}
+
 export async function validatePush(
   store: GitStore,
   commands: PushCommand[],
-  unpackError: string | null
+  unpackError: string | null,
+  packId: number | null
 ): Promise<PushPlan> {
   // whether the reachable cache is valid for the pre-push refs: only then can
   // it be extended in place (union with the connectivity walk) instead of
   // rebuilt from scratch on the next full clone
   const hadCache = store.getMeta("reachable-version") === store.reachableVersion();
+  // A fresh push (no cache to extend) verifies connectivity in SQL rather than
+  // by walking into an OidSet — the walk's result would be discarded by the
+  // commit step's invalidate below, so it was pure memory spent to reject a
+  // broken pack. `packMissing` names the first unresolved child, or stays null.
+  // A fast-forward keeps the cheap new-object walk, which both verifies and
+  // extends the cache in one pass.
+  const packMissing =
+    !hadCache && !unpackError && packId !== null ? await packComplete(store, packId) : null;
   // pre-existing ref tips bound the connectivity walk: their closure is
   // already validated, so a normal fast-forward only re-checks new objects
   const known = new OidSet(4096);
@@ -1038,7 +1274,10 @@ export async function validatePush(
       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, del: true });
       continue;
     }
-    if (!(await reachableComplete(store, cmd.next, known))) {
+    const connected = hadCache
+      ? await reachableComplete(store, cmd.next, known)
+      : packMissing === null && store.has(cmd.next);
+    if (!connected) {
       decisions.push({ ref: cmd.ref, expectedOld: cmd.old, reject: "missing necessary objects" });
       continue;
     }

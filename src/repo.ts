@@ -762,15 +762,23 @@ export class RepoCell extends DurableObject<Env> {
     }
 
     let unpackError: string | null = null;
+    let packId: number | null = null;
     if (hasPack) {
       try {
-        // a dedicated cache makes pack-adjacent delta bases nearly free; on
-        // real Workers the whole isolate has a hard 128MB, so stay small there
-        const budget = typeof caches !== "undefined" ? 16 * 1024 * 1024 : 512 * 1024 * 1024;
+        // a dedicated cache makes pack-adjacent delta bases nearly free, but a
+        // miss just reloads the base from SQLite, so the budget bounds peak
+        // memory rather than correctness. Real Workers have a hard 128MB
+        // isolate (stay tiny); celld runs a multi-GB heap but a push must still
+        // fit a bounded container, so default to 64MB there instead of holding
+        // the whole working set. Operators tune it with INGEST_CACHE_MB.
+        const onWorkers = typeof caches !== "undefined";
+        const defaultCacheMb = onWorkers ? 16 : 64;
+        const cacheMb = parseInt(this.env.INGEST_CACHE_MB ?? "", 10) || defaultCacheMb;
+        const budget = Math.max(1, cacheMb) * 1024 * 1024;
         // content-length ~= pack size; it selects the R2-vs-SQLite backend before
         // the first byte lands. Absent (chunked, i.e. a >1MB push) → undefined → R2.
         const declared = parseInt(req.headers.get("content-length") ?? "", 10);
-        await this.store.packs.ingest(firstPackBytes, reader, {
+        const ingested = await this.store.packs.ingest(firstPackBytes, reader, {
           maxBytes,
           sizeHint: Number.isFinite(declared) ? declared : undefined,
           cache: new ObjCache(budget),
@@ -778,6 +786,7 @@ export class RepoCell extends DurableObject<Env> {
           flush: () => this.ctx.storage.sync(),
           collisionDetect: this.env.SHA1DC === "1",
         });
+        packId = ingested.packId;
       } catch (err) {
         unpackError = err instanceof Error ? err.message : String(err);
         console.log(`[receive ${repo}] unpack error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -793,7 +802,7 @@ export class RepoCell extends DurableObject<Env> {
     // are fetched over the network, which transactionSync cannot await), then
     // apply the ref writes under one savepoint — a multi-ref push (git push
     // --all) must not leave half its branches moved if a later update throws
-    const plan = await validatePush(this.store, commands, unpackError);
+    const plan = await validatePush(this.store, commands, unpackError, packId);
     const { results, changed, needsGc } = this.ctx.storage.transactionSync(() =>
       commitPush(this.store, plan)
     );

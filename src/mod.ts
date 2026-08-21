@@ -547,9 +547,12 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
       const stub = env.REPO.getByName(repo);
       const doUrl = new URL(req.url);
       doUrl.pathname = sub;
-      // On celld, re-wrapping a bytes-backed request yields a stream-backed one
-      // whose consumption UTF-8-decodes the whole body (fatal for multi-hundred-
-      // MB binary packs). Forward explicit bytes there; stream on workerd.
+      // The push body streams straight through to the repository cell — the
+      // outer Worker never holds the pack. celld <0.3 re-wrapped a bytes-backed
+      // request into a stream-backed one that UTF-8-decoded the whole body
+      // (fatal for a binary pack), so this path requires celld >=0.3, where the
+      // body decodes lazily (denoland/celld.dev#129) and a local Durable Object
+      // call forwards the body as a stream (denoland/celld.dev#156).
       let fwdBody: BodyInit | null = null;
       if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
         const declared = parseInt(req.headers.get("content-length") ?? "", 10);
@@ -574,7 +577,7 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
           }
           fwdBody = raw; // miss: forward the original (still-encoded) bytes to the DO
         } else {
-          fwdBody = pageCache() === null ? ((await req.arrayBuffer()) as ArrayBuffer) : req.body;
+          fwdBody = req.body;
         }
       }
       const fwd = new Request(doUrl.toString(), {
